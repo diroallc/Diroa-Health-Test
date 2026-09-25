@@ -84,6 +84,11 @@
   <div id="root" class="h-full"></div>
 
   <script type="text/babel">
+
+  const SUPABASE_URL = 'https://ikzrbztopdmxhneloyim.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlrenJienRvcGRteGhuZWxveWltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTAzNzM0MDUsImV4cCI6MjEwNTk0OTQwNX0.yOtplAIElZrbdx-M-Cs12vE5Av6p8uBxiYY3IkHMCwA';
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    
     const { useState, useEffect, useRef } = React;
 
     const Icons = {
