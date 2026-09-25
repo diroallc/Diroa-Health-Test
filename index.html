@@ -88,6 +88,58 @@
   const SUPABASE_URL = 'https://ikzrbztopdmxhneloyim.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlrenJienRvcGRteGhuZWxveWltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTAzNzM0MDUsImV4cCI6MjEwNTk0OTQwNX0.yOtplAIElZrbdx-M-Cs12vE5Av6p8uBxiYY3IkHMCwA';
 const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+
+
+// Sign Up
+async function handleSignUp(email, password, fullName) {
+  const { data, error } = await supabase.auth.signUp({
+    email: email,
+    password: password,
+    options: {
+      data: { full_name: fullName }
+    }
+  });
+  if (error) alert(error.message);
+  else alert('Check your email for the confirmation link!');
+}
+
+// Sign In
+async function handleLogin(email, password) {
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: email,
+    password: password,
+  });
+  if (error) alert(error.message);
+}
+
+// Sign Out
+async function handleLogout() {
+  await supabase.auth.signOut();
+}
+
+// Fetch Profile Data on Load
+async function fetchUserProfile(userId) {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', userId)
+    .single();
+  
+  if (error) console.error(error);
+  return data;
+}
+
+// Save Profile Updates to Database
+async function saveUserProfile(userId, updatedFields) {
+  const { data, error } = await supabase
+    .from('profiles')
+    .update(updatedFields)
+    .eq('id', userId);
+    
+  if (error) alert('Error saving: ' + error.message);
+  else alert('Health profile saved successfully!');
+}
     
     const { useState, useEffect, useRef } = React;
 
