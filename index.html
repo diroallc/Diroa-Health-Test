@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -112,7 +111,9 @@
       const [isSignUp, setIsSignUp] = React.useState(false);
       const [authEmail, setAuthEmail] = React.useState('');
       const [authPassword, setAuthPassword] = React.useState('');
+      const [authConfirmPassword, setAuthConfirmPassword] = React.useState('');
       const [authName, setAuthName] = React.useState('');
+      const [authError, setAuthError] = React.useState('');
 
       // User Profile Form State (Blank defaults for real user input)
       const [fullName, setFullName] = React.useState('');
@@ -163,6 +164,22 @@
         setEmergencyContact('');
       }
 
+      function closeAuthModal() {
+        setShowAuthModal(false);
+        setAuthError('');
+        setAuthEmail('');
+        setAuthPassword('');
+        setAuthConfirmPassword('');
+        setAuthName('');
+      }
+
+      function toggleAuthMode() {
+        setIsSignUp(!isSignUp);
+        setAuthError('');
+        setAuthPassword('');
+        setAuthConfirmPassword('');
+      }
+
       async function loadProfile(userId) {
         const data = await fetchUserProfile(userId);
         if (data) {
@@ -181,13 +198,23 @@
 
       async function submitAuth(e) {
         e.preventDefault();
+        setAuthError('');
+
         if (isSignUp) {
+          // Verify-password check: both password fields must match before
+          // we ever call the Supabase backend.
+          if (authPassword !== authConfirmPassword) {
+            setAuthError('Passwords do not match. Please re-enter them.');
+            return;
+          }
+          if (authPassword.length < 6) {
+            setAuthError('Password must be at least 6 characters.');
+            return;
+          }
+
           const success = await handleSignUp(authEmail, authPassword, authName);
           if (success) {
-            setShowAuthModal(false);
-            setAuthEmail('');
-            setAuthPassword('');
-            setAuthName('');
+            closeAuthModal();
           }
         } else {
           const loggedInUser = await handleLogin(authEmail, authPassword);
@@ -570,7 +597,7 @@
             <div className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-50">
               <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-full max-w-md shadow-2xl relative">
                 <button 
-                  onClick={() => setShowAuthModal(false)}
+                  onClick={closeAuthModal}
                   className="absolute top-4 right-4 text-slate-400 hover:text-white text-sm"
                 >
                   ✕
@@ -618,6 +645,30 @@
                       placeholder="••••••••"
                     />
                   </div>
+
+                  {/* Confirm Password field — only shown during sign-up */}
+                  {isSignUp && (
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Confirm Password</label>
+                      <input
+                        type="password"
+                        required
+                        value={authConfirmPassword}
+                        onChange={(e) => setAuthConfirmPassword(e.target.value)}
+                        className={`w-full bg-slate-900 border rounded-lg p-2.5 text-xs text-slate-100 focus:outline-none ${
+                          authConfirmPassword && authConfirmPassword !== authPassword
+                            ? 'border-red-500 focus:border-red-500'
+                            : 'border-slate-700 focus:border-cyan-500'
+                        }`}
+                        placeholder="••••••••"
+                      />
+                    </div>
+                  )}
+
+                  {authError && (
+                    <p className="text-xs text-red-400 -mt-1">{authError}</p>
+                  )}
+
                   <button
                     type="submit"
                     className="w-full py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold text-xs rounded-lg transition shadow-md shadow-cyan-900/30"
@@ -629,7 +680,7 @@
                 <div className="mt-4 text-center">
                   <button
                     type="button"
-                    onClick={() => setIsSignUp(!isSignUp)}
+                    onClick={toggleAuthMode}
                     className="text-xs text-cyan-400 hover:underline"
                   >
                     {isSignUp ? 'Already have an account? Sign In' : "Don't have an account? Register"}
