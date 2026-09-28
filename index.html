@@ -551,7 +551,7 @@
 
 
       // =========================================================================
-      // 7. LOAD VAULT FILES WHEN VAULT TAB IS OPEN
+      // 7. SEARCH DROPDOWN: CLOSE WHEN CLICKING OUTSIDE
       // =========================================================================
 
       React.useEffect(() => {
@@ -573,7 +573,18 @@
 
 
       // =========================================================================
-      // 8. LOAD MESSAGES / CONVERSATIONS
+      // 8. LOAD VAULT FILES WHEN VAULT TAB IS OPEN
+      // =========================================================================
+
+      React.useEffect(() => {
+        if (user && canUseApp && activeTab === 'vault') {
+          loadVaultFiles(user.id);
+        }
+      }, [activeTab, user, canUseApp]);
+
+
+      // =========================================================================
+      // 9. LOAD MESSAGES / CONVERSATIONS
       // =========================================================================
 
       React.useEffect(() => {
