@@ -161,6 +161,14 @@
         return false;
       }
 
+      // With email confirmation on, Supabase reports success for an email that
+      // is already registered but changes nothing (no new account type, no new
+      // details). Say so instead of pretending a new account was created.
+      if (Array.isArray(data?.user?.identities) && data.user.identities.length === 0) {
+        alert('An account with this email already exists, so nothing was created or changed. Sign in with that account, or register with a different email address.');
+        return false;
+      }
+
       alert(
         requiresVerification(accountType)
           ? 'Account registered! Your details will be reviewed. Once any email confirmation is complete you can sign in, and full access unlocks after you are verified.'
