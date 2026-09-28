@@ -43,14 +43,109 @@
 
 
     // =========================================================================
+    // 2b. ACCOUNT TYPES & VERIFICATION HELPERS
+    // =========================================================================
+
+    const ACCOUNT_TYPES = [
+      { id: 'patient', label: 'Patient', hint: 'Patients get instant access. No verification needed.' },
+      { id: 'provider', label: 'Provider', hint: 'Providers submit their license details and are verified before gaining full access.' },
+      { id: 'institution', label: 'Institution', hint: 'Institutions submit their registration details and are verified before gaining full access.' }
+    ];
+
+    const INSTITUTION_TYPES = [
+      'Hospital',
+      'Clinic / Medical Practice',
+      'Pharmacy',
+      'Laboratory / Imaging Center',
+      'Emergency / Urgent Care',
+      'Other'
+    ];
+
+    const EMPTY_CREDENTIALS = {
+      specialty: '',
+      licenseNumber: '',
+      licenseRegion: '',
+      npiNumber: '',
+      institutionName: '',
+      institutionType: '',
+      registrationNumber: '',
+      institutionAddress: ''
+    };
+
+    // Form field name -> profiles table column
+    const CREDENTIAL_COLUMNS = {
+      specialty: 'specialty',
+      licenseNumber: 'license_number',
+      licenseRegion: 'license_region',
+      npiNumber: 'npi_number',
+      institutionName: 'institution_name',
+      institutionType: 'institution_type',
+      registrationNumber: 'registration_number',
+      institutionAddress: 'institution_address'
+    };
+
+    // Which credential fields each account type uses
+    const CREDENTIAL_FIELDS = {
+      provider: ['specialty', 'licenseNumber', 'licenseRegion', 'npiNumber'],
+      institution: ['institutionName', 'institutionType', 'registrationNumber', 'institutionAddress']
+    };
+
+    // Everything except the optional NPI number is required
+    const REQUIRED_CREDENTIALS = {
+      provider: ['specialty', 'licenseNumber', 'licenseRegion'],
+      institution: ['institutionName', 'institutionType', 'registrationNumber', 'institutionAddress']
+    };
+
+    function requiresVerification(accountType) {
+      return accountType === 'provider' || accountType === 'institution';
+    }
+
+    // Trimmed credentials for the given account type (used at registration)
+    function cleanCredentials(creds, accountType) {
+      const cleaned = {};
+      (CREDENTIAL_FIELDS[accountType] || []).forEach((key) => {
+        cleaned[key] = (creds?.[key] ?? '').toString().trim();
+      });
+      return cleaned;
+    }
+
+    // Form values -> profiles table columns (empty values become null)
+    function credentialsToColumns(creds, accountType) {
+      const columns = {};
+      (CREDENTIAL_FIELDS[accountType] || []).forEach((key) => {
+        const value = (creds?.[key] ?? '').toString().trim();
+        columns[CREDENTIAL_COLUMNS[key]] = value || null;
+      });
+      return columns;
+    }
+
+    // profiles table row -> form values
+    function columnsToCredentials(row) {
+      const creds = { ...EMPTY_CREDENTIALS };
+      Object.keys(CREDENTIAL_COLUMNS).forEach((key) => {
+        creds[key] = row?.[CREDENTIAL_COLUMNS[key]] || '';
+      });
+      return creds;
+    }
+
+
+    // =========================================================================
     // 3. AUTHENTICATION HELPERS
     // =========================================================================
 
-    async function handleSignUp(email, password, fullName) {
+    async function handleSignUp(email, password, fullName, accountType = 'patient', credentials = {}) {
       const { data, error } = await supabase.auth.signUp({
         email: email,
         password: password,
-        options: { data: { full_name: fullName } }
+        options: {
+          data: {
+            full_name: fullName,
+            account_type: accountType,
+            ...(requiresVerification(accountType)
+              ? { credentials: cleanCredentials(credentials, accountType) }
+              : {})
+          }
+        }
       });
 
       if (error) {
@@ -58,7 +153,11 @@
         return false;
       }
 
-      alert('Account registered! If email confirmation is enabled, check your inbox.');
+      alert(
+        requiresVerification(accountType)
+          ? 'Account registered! Your details will be reviewed. Once any email confirmation is complete you can sign in, and full access unlocks after you are verified.'
+          : 'Account registered! If email confirmation is enabled, check your inbox.'
+      );
       return true;
     }
 
@@ -97,6 +196,34 @@
       }
 
       return data;
+    }
+
+    // Creates the profile row the first time an account signs in, using the
+    // account type and credentials supplied at registration. Verification
+    // status is NOT sent from the browser: the database sets it.
+    async function createInitialProfile(authUser) {
+      const meta = authUser.user_metadata || {};
+      const type = ACCOUNT_TYPES.some((t) => t.id === meta.account_type) ? meta.account_type : 'patient';
+
+      const payload = {
+        id: authUser.id,
+        email: authUser.email,
+        full_name: meta.full_name || '',
+        account_type: type,
+        ...(requiresVerification(type) ? credentialsToColumns(meta.credentials || {}, type) : {}),
+        updated_at: new Date().toISOString()
+      };
+
+      const { error } = await supabase
+        .from('profiles')
+        .upsert(payload, { onConflict: 'id', ignoreDuplicates: true });
+
+      if (error) {
+        console.error('Error creating profile:', error.message);
+        return null;
+      }
+
+      return fetchUserProfile(authUser.id);
     }
 
     async function saveUserProfile(userId, profileData) {
@@ -143,6 +270,8 @@
       const [authConfirmPassword, setAuthConfirmPassword] = React.useState('');
       const [authName, setAuthName] = React.useState('');
       const [authError, setAuthError] = React.useState('');
+      const [authAccountType, setAuthAccountType] = React.useState('patient');
+      const [authCredentials, setAuthCredentials] = React.useState({ ...EMPTY_CREDENTIALS });
 
       // -----------------------------------------------------------------------
       // PROFILE FORM
@@ -161,6 +290,20 @@
       // Current medical condition / diagnosis, edited directly from the Dashboard
       const [medicalCondition, setMedicalCondition] = React.useState('');
       const [savingCondition, setSavingCondition] = React.useState(false);
+
+      // -----------------------------------------------------------------------
+      // ACCOUNT TYPE & VERIFICATION
+      // -----------------------------------------------------------------------
+      const [accountType, setAccountType] = React.useState('patient');
+      const [verificationStatus, setVerificationStatus] = React.useState('not_required');
+      const [verificationNotes, setVerificationNotes] = React.useState('');
+      const [credentials, setCredentials] = React.useState({ ...EMPTY_CREDENTIALS });
+      const [savingCredentials, setSavingCredentials] = React.useState(false);
+      const [refreshingStatus, setRefreshingStatus] = React.useState(false);
+      const [profileReady, setProfileReady] = React.useState(false);
+
+      // Patients are active immediately; providers and institutions only once verified
+      const canUseApp = !requiresVerification(accountType) || verificationStatus === 'verified';
 
       // -----------------------------------------------------------------------
       // MEDICAL VAULT STATE
@@ -183,7 +326,7 @@
           const currentUser = session?.user ?? null;
           setUser(currentUser);
           if (currentUser) {
-            loadProfile(currentUser.id);
+            loadProfile(currentUser.id, currentUser);
           }
           setLoading(false);
         });
@@ -192,11 +335,12 @@
           const currentUser = session?.user ?? null;
           setUser(currentUser);
           if (currentUser) {
-            loadProfile(currentUser.id);
+            loadProfile(currentUser.id, currentUser);
           } else {
             setUserProfile(null);
             clearForm();
             setVaultFiles([]);
+            setProfileReady(false);
           }
         });
 
@@ -209,10 +353,10 @@
       // =========================================================================
 
       React.useEffect(() => {
-        if (user && activeTab === 'vault') {
+        if (user && canUseApp && activeTab === 'vault') {
           loadVaultFiles(user.id);
         }
-      }, [activeTab, user]);
+      }, [activeTab, user, canUseApp]);
 
 
       // =========================================================================
@@ -230,6 +374,10 @@
         setMedications('');
         setEmergencyContact('');
         setMedicalCondition('');
+        setAccountType('patient');
+        setVerificationStatus('not_required');
+        setVerificationNotes('');
+        setCredentials({ ...EMPTY_CREDENTIALS });
       }
 
 
@@ -237,27 +385,49 @@
       // 9. LOAD PROFILE
       // =========================================================================
 
-      async function loadProfile(userId) {
-        const data = await fetchUserProfile(userId);
+      async function loadProfile(userId, authUser) {
+        try {
+          let data = await fetchUserProfile(userId);
 
-        if (data) {
-          setUserProfile(data);
-          setFullName(data.full_name || '');
-          setBloodType(data.blood_type || '');
-          setAge(data.age || '');
-          setHeight(data.height || '');
-          setWeight(data.weight || '');
-          setPrimaryDoctor(data.primary_doctor || '');
-          setAllergies(Array.isArray(data.allergies) ? data.allergies.join(', ') : (data.allergies || ''));
-          setMedications(Array.isArray(data.medications) ? data.medications.join(', ') : (data.medications || ''));
-          setEmergencyContact(data.emergency_contact || '');
-          setMedicalCondition(data.medical_condition || '');
-        } else {
-          // If there is no profile row yet, use the user's auth metadata.
-          const metadata = user?.user_metadata || {};
-          if (metadata.full_name && !fullName) {
-            setFullName(metadata.full_name);
+          // First sign-in for this account: create the profile row from the
+          // details supplied at registration (account type + credentials).
+          if (!data && authUser) {
+            data = await createInitialProfile(authUser);
           }
+
+          if (data) {
+            setUserProfile(data);
+            setAccountType(data.account_type || 'patient');
+            setVerificationStatus(data.verification_status || 'not_required');
+            setVerificationNotes(data.verification_notes || '');
+            setCredentials(columnsToCredentials(data));
+            setFullName(data.full_name || '');
+            setBloodType(data.blood_type || '');
+            setAge(data.age || '');
+            setHeight(data.height || '');
+            setWeight(data.weight || '');
+            setPrimaryDoctor(data.primary_doctor || '');
+            setAllergies(Array.isArray(data.allergies) ? data.allergies.join(', ') : (data.allergies || ''));
+            setMedications(Array.isArray(data.medications) ? data.medications.join(', ') : (data.medications || ''));
+            setEmergencyContact(data.emergency_contact || '');
+            setMedicalCondition(data.medical_condition || '');
+          } else {
+            // No profile could be read, so fall back to the auth metadata.
+            const metadata = authUser?.user_metadata || {};
+
+            if (metadata.full_name && !fullName) {
+              setFullName(metadata.full_name);
+            }
+
+            // Never fail open: accounts that need verification stay locked.
+            if (requiresVerification(metadata.account_type)) {
+              setAccountType(metadata.account_type);
+              setVerificationStatus('pending');
+              setCredentials({ ...EMPTY_CREDENTIALS, ...(metadata.credentials || {}) });
+            }
+          }
+        } finally {
+          setProfileReady(true);
         }
       }
 
@@ -471,6 +641,8 @@
         setAuthPassword('');
         setAuthConfirmPassword('');
         setAuthName('');
+        setAuthAccountType('patient');
+        setAuthCredentials({ ...EMPTY_CREDENTIALS });
       }
 
       function toggleAuthMode() {
@@ -478,6 +650,8 @@
         setAuthError('');
         setAuthPassword('');
         setAuthConfirmPassword('');
+        setAuthAccountType('patient');
+        setAuthCredentials({ ...EMPTY_CREDENTIALS });
       }
 
 
@@ -502,7 +676,18 @@
             return;
           }
 
-          const success = await handleSignUp(authEmail, authPassword, authName);
+          if (requiresVerification(authAccountType)) {
+            const missing = (REQUIRED_CREDENTIALS[authAccountType] || []).filter(
+              (key) => !(authCredentials[key] || '').trim()
+            );
+
+            if (missing.length > 0) {
+              setAuthError('Please complete all required verification details.');
+              return;
+            }
+          }
+
+          const success = await handleSignUp(authEmail, authPassword, authName, authAccountType, authCredentials);
           if (success) {
             closeAuthModal();
           }
@@ -581,6 +766,332 @@
 
 
       // =========================================================================
+      // 16c. ACCOUNT TYPE & VERIFICATION (providers / institutions)
+      // =========================================================================
+
+      function updateAuthCredential(key, value) {
+        setAuthCredentials((previous) => ({ ...previous, [key]: value }));
+      }
+
+      function updateCredential(key, value) {
+        setCredentials((previous) => ({ ...previous, [key]: value }));
+      }
+
+      // True when the credentials in the form differ from what is saved
+      function credentialsChanged() {
+        const saved = columnsToCredentials(userProfile);
+        return (CREDENTIAL_FIELDS[accountType] || []).some(
+          (key) => (credentials[key] || '').trim() !== (saved[key] || '').trim()
+        );
+      }
+
+      async function handleSaveProfessionalProfile(e) {
+        e.preventDefault();
+        if (!user) return;
+
+        const missing = (REQUIRED_CREDENTIALS[accountType] || []).filter(
+          (key) => !(credentials[key] || '').trim()
+        );
+
+        if (!fullName.trim() || missing.length > 0) {
+          alert('Please complete all required fields.');
+          return;
+        }
+
+        const changed = credentialsChanged();
+
+        if (verificationStatus === 'rejected' && !changed) {
+          alert('Please update your credentials before resubmitting for review.');
+          return;
+        }
+
+        if (verificationStatus === 'verified' && changed) {
+          const confirmed = window.confirm(
+            'Changing your credentials sends your account back for verification, and your access is paused until it is approved again. Continue?'
+          );
+          if (!confirmed) return;
+        }
+
+        setSavingCredentials(true);
+
+        // Verification status is never sent from the browser. The database
+        // resets it to "pending" whenever credentials change.
+        const success = await saveUserProfile(user.id, {
+          email: user.email,
+          full_name: fullName.trim(),
+          ...credentialsToColumns(credentials, accountType)
+        });
+
+        if (success) {
+          alert(changed ? 'Credentials saved and submitted for verification.' : 'Profile saved successfully!');
+          await loadProfile(user.id, user);
+        }
+
+        setSavingCredentials(false);
+      }
+
+      async function handleRefreshStatus() {
+        if (!user) return;
+
+        setRefreshingStatus(true);
+        await loadProfile(user.id, user);
+        setRefreshingStatus(false);
+      }
+
+      function getAccountBadge() {
+        if (accountType === 'patient') {
+          return { label: 'Patient', className: 'text-slate-300 bg-slate-800 border-slate-700' };
+        }
+
+        const typeLabel = accountType === 'provider' ? 'Provider' : 'Institution';
+
+        if (verificationStatus === 'verified') {
+          return { label: `Verified ${typeLabel}`, className: 'text-emerald-300 bg-emerald-950/70 border-emerald-800/60' };
+        }
+
+        if (verificationStatus === 'rejected') {
+          return { label: `${typeLabel} · Not Approved`, className: 'text-red-300 bg-red-950/60 border-red-800/60' };
+        }
+
+        return { label: `${typeLabel} · Pending`, className: 'text-amber-300 bg-amber-950/60 border-amber-800/60' };
+      }
+
+      function getProfessionalSummary() {
+        if (accountType === 'provider') {
+          return [
+            ['Specialty', credentials.specialty],
+            ['License Number', credentials.licenseNumber],
+            ['Licensed In', credentials.licenseRegion],
+            ['NPI Number', credentials.npiNumber]
+          ];
+        }
+
+        return [
+          ['Institution', credentials.institutionName],
+          ['Type', credentials.institutionType],
+          ['Registration ID', credentials.registrationNumber],
+          ['Address', credentials.institutionAddress]
+        ];
+      }
+
+      // Shared by the sign-up form, the verification screen and the Edit Profile tab
+      function renderCredentialFields(type, values, onChange) {
+        const inputClass = 'w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-100 focus:outline-none focus:border-cyan-500';
+        const labelClass = 'block text-xs font-medium text-slate-400 mb-1';
+
+        if (type === 'provider') {
+          return (
+            <div className="space-y-4">
+              <div>
+                <label className={labelClass}>Specialty</label>
+                <input
+                  type="text"
+                  required
+                  value={values.specialty}
+                  onChange={(e) => onChange('specialty', e.target.value)}
+                  placeholder="e.g. Cardiology"
+                  className={inputClass}
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className={labelClass}>Professional License Number</label>
+                  <input
+                    type="text"
+                    required
+                    value={values.licenseNumber}
+                    onChange={(e) => onChange('licenseNumber', e.target.value)}
+                    placeholder="e.g. A123456"
+                    className={inputClass}
+                  />
+                </div>
+                <div>
+                  <label className={labelClass}>License Issued In (State / Country)</label>
+                  <input
+                    type="text"
+                    required
+                    value={values.licenseRegion}
+                    onChange={(e) => onChange('licenseRegion', e.target.value)}
+                    placeholder="e.g. Texas, USA"
+                    className={inputClass}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className={labelClass}>NPI Number (optional)</label>
+                <input
+                  type="text"
+                  value={values.npiNumber}
+                  onChange={(e) => onChange('npiNumber', e.target.value)}
+                  placeholder="e.g. 1234567890"
+                  className={inputClass}
+                />
+              </div>
+            </div>
+          );
+        }
+
+        if (type === 'institution') {
+          return (
+            <div className="space-y-4">
+              <div>
+                <label className={labelClass}>Institution Name</label>
+                <input
+                  type="text"
+                  required
+                  value={values.institutionName}
+                  onChange={(e) => onChange('institutionName', e.target.value)}
+                  placeholder="e.g. Riverside General Hospital"
+                  className={inputClass}
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className={labelClass}>Institution Type</label>
+                  <select
+                    required
+                    value={values.institutionType}
+                    onChange={(e) => onChange('institutionType', e.target.value)}
+                    className={inputClass}
+                  >
+                    <option value="">Select Type...</option>
+                    {INSTITUTION_TYPES.map((option) => (
+                      <option key={option} value={option}>{option}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className={labelClass}>Registration / Tax ID</label>
+                  <input
+                    type="text"
+                    required
+                    value={values.registrationNumber}
+                    onChange={(e) => onChange('registrationNumber', e.target.value)}
+                    placeholder="e.g. 12-3456789"
+                    className={inputClass}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className={labelClass}>Institution Address</label>
+                <input
+                  type="text"
+                  required
+                  value={values.institutionAddress}
+                  onChange={(e) => onChange('institutionAddress', e.target.value)}
+                  placeholder="e.g. 100 Main St, Dallas, TX 75201"
+                  className={inputClass}
+                />
+              </div>
+            </div>
+          );
+        }
+
+        return null;
+      }
+
+      // Shared by the verification screen and the Edit Profile tab
+      function renderProfessionalForm(submitLabel) {
+        return (
+          <form onSubmit={handleSaveProfessionalProfile} className="space-y-5">
+            <div>
+              <label className="block text-xs font-medium text-slate-400 mb-1">
+                {accountType === 'institution' ? 'Authorized Representative Name' : 'Full Legal Name'}
+              </label>
+              <input
+                type="text"
+                required
+                value={fullName}
+                onChange={(e) => setFullName(e.target.value)}
+                placeholder="e.g. Alex Morgan"
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-100 focus:outline-none focus:border-cyan-500"
+              />
+            </div>
+
+            {renderCredentialFields(accountType, credentials, updateCredential)}
+
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              Changing your credentials sends your account back to be verified again.
+            </p>
+
+            <div className="pt-2">
+              <button
+                type="submit"
+                disabled={savingCredentials}
+                className="px-6 py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold text-xs rounded-lg transition shadow-lg shadow-cyan-900/30 disabled:opacity-50"
+              >
+                {savingCredentials ? 'Saving Records...' : submitLabel}
+              </button>
+            </div>
+          </form>
+        );
+      }
+
+      // Shown instead of the portal while a provider / institution is unverified
+      function renderVerificationScreen() {
+        const isRejected = verificationStatus === 'rejected';
+        const typeLabel = accountType === 'institution' ? 'institution' : 'provider';
+
+        return (
+          <div className="space-y-6 max-w-2xl mx-auto">
+            <div className={`rounded-2xl p-6 shadow-xl border ${isRejected ? 'bg-red-950/30 border-red-900/60' : 'bg-slate-800/60 border-slate-700'}`}>
+              <div className="flex items-start gap-4">
+                <div className="w-11 h-11 rounded-xl bg-slate-900 flex items-center justify-center text-xl shrink-0">
+                  {isRejected ? '⚠️' : '⏳'}
+                </div>
+
+                <div className="min-w-0 flex-1">
+                  <h2 className="text-xl font-bold text-white mb-1">
+                    {isRejected ? 'Verification Not Approved' : 'Verification In Progress'}
+                  </h2>
+                  <p className="text-xs text-slate-400 leading-relaxed">
+                    {isRejected
+                      ? `We were unable to verify your ${typeLabel} details. Review the note below, update your credentials, and resubmit.`
+                      : `Thanks for registering as a ${typeLabel}. Your credentials are being reviewed, and full access to the portal unlocks as soon as your account is verified.`}
+                  </p>
+
+                  {isRejected && verificationNotes && (
+                    <div className="mt-3 bg-slate-900/60 border border-red-900/50 rounded-lg p-3">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-red-300 mb-1">Reviewer Note</p>
+                      <p className="text-xs text-slate-300 leading-relaxed">{verificationNotes}</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-5 flex items-center justify-between gap-3 flex-wrap">
+                <p className="text-[10px] text-slate-500">
+                  Status: <span className="font-semibold text-slate-300">{isRejected ? 'Not approved' : 'Pending review'}</span>
+                </p>
+                <button
+                  onClick={handleRefreshStatus}
+                  disabled={refreshingStatus}
+                  className="px-3 py-1.5 text-[10px] font-semibold bg-slate-900 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-300 disabled:opacity-50"
+                >
+                  {refreshingStatus ? 'Checking...' : 'Check Status'}
+                </button>
+              </div>
+            </div>
+
+            <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
+              <h3 className="text-sm font-bold text-white mb-1">Submitted Credentials</h3>
+              <p className="text-[10px] text-slate-500 mb-5">
+                {isRejected
+                  ? 'Correct anything that needs fixing, then resubmit for review.'
+                  : 'Spot a mistake? Update your details here. Your review restarts with the new information.'}
+              </p>
+              {renderProfessionalForm(isRejected ? 'Update & Resubmit for Review' : 'Save Changes')}
+            </div>
+          </div>
+        );
+      }
+
+
+      // =========================================================================
       // 17. HELPER FUNCTIONS FOR THE VAULT UI
       // =========================================================================
 
@@ -611,7 +1122,7 @@
       // 18. LOADING SCREEN
       // =========================================================================
 
-      if (loading) {
+      if (loading || (user && !profileReady)) {
         return (
           <div className="flex h-screen items-center justify-center bg-slate-900 text-slate-100">
             <div className="text-center">
@@ -647,7 +1158,7 @@
             </div>
 
             {/* Navigation Bar */}
-            {user && (
+            {user && canUseApp && (
               <nav className="hidden md:flex items-center gap-1 bg-slate-900/90 p-1 rounded-xl border border-slate-800">
                 <button
                   onClick={() => setActiveTab('dashboard')}
@@ -673,6 +1184,9 @@
             <div>
               {user ? (
                 <div className="flex items-center gap-4">
+                  <span className={`hidden lg:inline-flex px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider rounded-full border ${getAccountBadge().className}`}>
+                    {getAccountBadge().label}
+                  </span>
                   <span className="text-xs font-medium text-slate-400 hidden sm:inline">{user.email}</span>
                   <button
                     onClick={handleLogout}
@@ -693,7 +1207,7 @@
           </header>
 
           {/* Mobile Navigation */}
-          {user && (
+          {user && canUseApp && (
             <div className="flex md:hidden bg-slate-950 border-b border-slate-800 p-2 justify-around">
               <button
                 onClick={() => setActiveTab('dashboard')}
@@ -719,10 +1233,13 @@
           {/* Main Content Area */}
           <main className="p-6 max-w-5xl mx-auto flex-1 w-full">
             {user ? (
+              !canUseApp ? (
+                renderVerificationScreen()
+              ) : (
               <div className="space-y-6">
 
-                {/* TAB 1: DASHBOARD */}
-                {activeTab === 'dashboard' && (
+                {/* TAB 1: DASHBOARD (PATIENT) */}
+                {activeTab === 'dashboard' && accountType === 'patient' && (
                   <div className="space-y-6">
                     <div className="bg-gradient-to-r from-slate-800 via-slate-800/90 to-slate-800/70 border border-slate-700/80 rounded-2xl p-6 shadow-xl relative overflow-hidden">
                       <div className="absolute top-0 right-0 w-72 h-72 bg-cyan-500/10 rounded-full blur-3xl pointer-events-none"></div>
@@ -817,8 +1334,61 @@
                   </div>
                 )}
 
-                {/* TAB 2: EDIT PROFILE FORM */}
-                {activeTab === 'profile' && (
+                {/* TAB 1: DASHBOARD (VERIFIED PROVIDER / INSTITUTION) */}
+                {activeTab === 'dashboard' && accountType !== 'patient' && (
+                  <div className="space-y-6">
+                    <div className="bg-gradient-to-r from-slate-800 via-slate-800/90 to-slate-800/70 border border-slate-700/80 rounded-2xl p-6 shadow-xl relative overflow-hidden">
+                      <div className="absolute top-0 right-0 w-72 h-72 bg-cyan-500/10 rounded-full blur-3xl pointer-events-none"></div>
+                      <div className="relative z-10">
+                        <span className="inline-block px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-emerald-300 bg-emerald-950/70 border border-emerald-800/60 rounded-full mb-3">
+                          {accountType === 'provider' ? 'Verified Provider' : 'Verified Institution'}
+                        </span>
+                        <h2 className="text-2xl font-extrabold text-white mb-1">
+                          Welcome, {(accountType === 'institution' && credentials.institutionName) || fullName || user.email}
+                        </h2>
+                        <p className="text-xs text-slate-400 max-w-xl leading-relaxed">
+                          Your verified {accountType === 'provider' ? 'professional' : 'institution'} profile is saved to your personal Supabase database and your documents are stored in your private account vault.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                      {getProfessionalSummary().map(([label, value]) => (
+                        <div key={label} className="bg-slate-800/60 border border-slate-700/60 rounded-xl p-4">
+                          <p className="text-[11px] font-semibold uppercase text-slate-400 mb-1">{label}</p>
+                          <p className="text-sm font-bold text-slate-200 truncate" title={value || ''}>{value || 'Not Set'}</p>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="bg-slate-800/40 border border-slate-800 rounded-xl p-6 flex items-center justify-between flex-wrap gap-4">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-200 mb-1">Manage Professional Profile</h3>
+                        <p className="text-xs text-slate-400">Update your credentials and contact details. Credential changes require re-verification.</p>
+                      </div>
+                      <button
+                        onClick={() => setActiveTab('profile')}
+                        className="px-4 py-2 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition"
+                      >
+                        Edit Professional Profile
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* TAB 2: EDIT PROFILE FORM (VERIFIED PROVIDER / INSTITUTION) */}
+                {activeTab === 'profile' && accountType !== 'patient' && (
+                  <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
+                    <h2 className="text-xl font-bold text-white mb-1">
+                      {accountType === 'provider' ? 'Professional Profile' : 'Institution Profile'}
+                    </h2>
+                    <p className="text-xs text-slate-400 mb-6">Keep your details up to date. Submitting saves directly to your database.</p>
+                    {renderProfessionalForm('Save Profile to Database')}
+                  </div>
+                )}
+
+                {/* TAB 2: EDIT PROFILE FORM (PATIENT) */}
+                {activeTab === 'profile' && accountType === 'patient' && (
                   <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
                     <h2 className="text-xl font-bold text-white mb-1">Personal Health Profile Template</h2>
                     <p className="text-xs text-slate-400 mb-6">Fill in your health records below. Submitting saves directly to your database.</p>
@@ -1073,6 +1643,7 @@
                 )}
 
               </div>
+              )
             ) : (
               /* SIGNED OUT HERO STATE */
               <div className="text-center py-20">
@@ -1099,7 +1670,7 @@
           {/* AUTH MODAL */}
           {showAuthModal && (
             <div className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-50">
-              <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-full max-w-md shadow-2xl relative">
+              <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-full max-w-md max-h-[90vh] overflow-y-auto shadow-2xl relative">
                 <button
                   onClick={closeAuthModal}
                   className="absolute top-4 right-4 text-slate-400 hover:text-white text-sm"
@@ -1116,7 +1687,30 @@
                 <form onSubmit={submitAuth} className="space-y-4">
                   {isSignUp && (
                     <div>
-                      <label className="block text-xs font-medium text-slate-400 mb-1">Full Name</label>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">I am signing up as</label>
+                      <div className="grid grid-cols-3 gap-2">
+                        {ACCOUNT_TYPES.map((type) => (
+                          <button
+                            key={type.id}
+                            type="button"
+                            onClick={() => setAuthAccountType(type.id)}
+                            className={`px-2 py-2 rounded-lg border text-xs font-semibold transition ${authAccountType === type.id ? 'bg-cyan-600 border-cyan-500 text-white' : 'bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200'}`}
+                          >
+                            {type.label}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="text-[10px] text-slate-500 mt-2 leading-relaxed">
+                        {ACCOUNT_TYPES.find((type) => type.id === authAccountType)?.hint}
+                      </p>
+                    </div>
+                  )}
+
+                  {isSignUp && (
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">
+                        {authAccountType === 'institution' ? 'Authorized Representative Name' : 'Full Name'}
+                      </label>
                       <input
                         type="text"
                         required
@@ -1164,6 +1758,13 @@
                     </div>
                   )}
 
+                  {isSignUp && requiresVerification(authAccountType) && (
+                    <div className="border-t border-slate-700 pt-4 space-y-4">
+                      <p className="text-[11px] font-semibold uppercase tracking-wider text-cyan-400">Verification Details</p>
+                      {renderCredentialFields(authAccountType, authCredentials, updateAuthCredential)}
+                    </div>
+                  )}
+
                   {authError && (
                     <p className="text-xs text-red-400 -mt-1">{authError}</p>
                   )}
@@ -1172,7 +1773,7 @@
                     type="submit"
                     className="w-full py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold text-xs rounded-lg transition shadow-md shadow-cyan-900/30"
                   >
-                    {isSignUp ? 'Register Account' : 'Sign In'}
+                    {isSignUp ? (requiresVerification(authAccountType) ? 'Register & Submit for Verification' : 'Register Account') : 'Sign In'}
                   </button>
                 </form>
 
