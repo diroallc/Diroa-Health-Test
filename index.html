@@ -49,7 +49,7 @@
     const ACCOUNT_TYPES = [
       { id: 'patient', label: 'Patient', hint: 'Patients get instant access. No verification needed.' },
       { id: 'provider', label: 'Provider', hint: 'Providers submit their license details and are verified before gaining full access.' },
-      { id: 'institution', label: 'Institution', hint: 'Institutions submit their registration details and are verified before gaining full access.' }
+      { id: 'institution', label: 'Institution', hint: 'Institutions submit their name, type and address and are verified before gaining full access.' }
     ];
 
     const INSTITUTION_TYPES = [
@@ -68,7 +68,6 @@
       npiNumber: '',
       institutionName: '',
       institutionType: '',
-      registrationNumber: '',
       institutionAddress: ''
     };
 
@@ -80,20 +79,19 @@
       npiNumber: 'npi_number',
       institutionName: 'institution_name',
       institutionType: 'institution_type',
-      registrationNumber: 'registration_number',
       institutionAddress: 'institution_address'
     };
 
     // Which credential fields each account type uses
     const CREDENTIAL_FIELDS = {
       provider: ['specialty', 'licenseNumber', 'licenseRegion', 'npiNumber'],
-      institution: ['institutionName', 'institutionType', 'registrationNumber', 'institutionAddress']
+      institution: ['institutionName', 'institutionType', 'institutionAddress']
     };
 
     // Everything except the optional NPI number is required
     const REQUIRED_CREDENTIALS = {
       provider: ['specialty', 'licenseNumber', 'licenseRegion'],
-      institution: ['institutionName', 'institutionType', 'registrationNumber', 'institutionAddress']
+      institution: ['institutionName', 'institutionType', 'institutionAddress']
     };
 
     function requiresVerification(accountType) {
@@ -126,6 +124,16 @@
         creds[key] = row?.[CREDENTIAL_COLUMNS[key]] || '';
       });
       return creds;
+    }
+
+
+    // Value stored in profiles.full_name. Institutions have no representative,
+    // so their name is the institution's name.
+    function getSignupFullName(meta, accountType) {
+      if (accountType === 'institution') {
+        return (meta?.credentials?.institutionName || meta?.full_name || '').toString().trim();
+      }
+      return (meta?.full_name || '').toString();
     }
 
 
@@ -208,7 +216,7 @@
       const payload = {
         id: authUser.id,
         email: authUser.email,
-        full_name: meta.full_name || '',
+        full_name: getSignupFullName(meta, type),
         account_type: type,
         ...(requiresVerification(type) ? credentialsToColumns(meta.credentials || {}, type) : {}),
         updated_at: new Date().toISOString()
@@ -224,6 +232,37 @@
       }
 
       return fetchUserProfile(authUser.id);
+    }
+
+    // If a profile row already exists but was created without the account type
+    // the user chose at sign-up (for example by a database sign-up trigger, or
+    // before the account-type columns existed), apply that choice now. The
+    // database then puts the account into "pending" verification. It never
+    // grants "verified".
+    async function applySignupAccountType(authUser, profile) {
+      const meta = authUser.user_metadata || {};
+      const signupType = meta.account_type;
+
+      if (!requiresVerification(signupType) || (profile.account_type || 'patient') !== 'patient') {
+        return profile;
+      }
+
+      const { error } = await supabase
+        .from('profiles')
+        .update({
+          account_type: signupType,
+          full_name: getSignupFullName(meta, signupType) || profile.full_name || '',
+          ...credentialsToColumns(meta.credentials || {}, signupType),
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', authUser.id);
+
+      if (error) {
+        console.error('Could not apply the account type chosen at sign-up:', error.message);
+        return profile;
+      }
+
+      return (await fetchUserProfile(authUser.id)) || profile;
     }
 
     async function saveUserProfile(userId, profileData) {
@@ -395,7 +434,22 @@
             data = await createInitialProfile(authUser);
           }
 
-          if (data) {
+          // The row may have been created without the account type chosen at
+          // sign-up. Apply it now.
+          if (data && authUser) {
+            data = await applySignupAccountType(authUser, data);
+          }
+
+          const metadata = authUser?.user_metadata || {};
+
+          // Database without the account-type columns: never silently treat a
+          // provider / institution as a patient.
+          const schemaMissing = !!data && !('account_type' in data);
+          if (schemaMissing) {
+            console.error('profiles.account_type is missing. Run diroa-account-types.sql in the Supabase SQL Editor.');
+          }
+
+          if (data && !(schemaMissing && requiresVerification(metadata.account_type))) {
             setUserProfile(data);
             setAccountType(data.account_type || 'patient');
             setVerificationStatus(data.verification_status || 'not_required');
@@ -412,9 +466,7 @@
             setEmergencyContact(data.emergency_contact || '');
             setMedicalCondition(data.medical_condition || '');
           } else {
-            // No profile could be read, so fall back to the auth metadata.
-            const metadata = authUser?.user_metadata || {};
-
+            // No usable profile, so fall back to the auth metadata.
             if (metadata.full_name && !fullName) {
               setFullName(metadata.full_name);
             }
@@ -687,7 +739,11 @@
             }
           }
 
-          const success = await handleSignUp(authEmail, authPassword, authName, authAccountType, authCredentials);
+          const signUpName = authAccountType === 'institution'
+            ? (authCredentials.institutionName || '').trim()
+            : authName;
+
+          const success = await handleSignUp(authEmail, authPassword, signUpName, authAccountType, authCredentials);
           if (success) {
             closeAuthModal();
           }
@@ -793,7 +849,7 @@
           (key) => !(credentials[key] || '').trim()
         );
 
-        if (!fullName.trim() || missing.length > 0) {
+        if ((accountType !== 'institution' && !fullName.trim()) || missing.length > 0) {
           alert('Please complete all required fields.');
           return;
         }
@@ -818,7 +874,9 @@
         // resets it to "pending" whenever credentials change.
         const success = await saveUserProfile(user.id, {
           email: user.email,
-          full_name: fullName.trim(),
+          full_name: accountType === 'institution'
+            ? (credentials.institutionName || '').trim()
+            : fullName.trim(),
           ...credentialsToColumns(credentials, accountType)
         });
 
@@ -856,6 +914,16 @@
         return { label: `${typeLabel} · Pending`, className: 'text-amber-300 bg-amber-950/60 border-amber-800/60' };
       }
 
+      function formatVerifiedDate() {
+        if (!userProfile?.verified_at) return 'Verified';
+
+        return new Date(userProfile.verified_at).toLocaleDateString(undefined, {
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric'
+        });
+      }
+
       function getProfessionalSummary() {
         if (accountType === 'provider') {
           return [
@@ -867,15 +935,14 @@
         }
 
         return [
-          ['Institution', credentials.institutionName],
-          ['Type', credentials.institutionType],
-          ['Registration ID', credentials.registrationNumber],
-          ['Address', credentials.institutionAddress]
+          ['Institution Type', credentials.institutionType],
+          ['Address', credentials.institutionAddress],
+          ['Verified Since', formatVerifiedDate()]
         ];
       }
 
       // Shared by the sign-up form, the verification screen and the Edit Profile tab
-      function renderCredentialFields(type, values, onChange) {
+      function renderCredentialFields(type, values, onChange, options = {}) {
         const inputClass = 'w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-100 focus:outline-none focus:border-cyan-500';
         const labelClass = 'block text-xs font-medium text-slate-400 mb-1';
 
@@ -936,44 +1003,33 @@
         if (type === 'institution') {
           return (
             <div className="space-y-4">
-              <div>
-                <label className={labelClass}>Institution Name</label>
-                <input
-                  type="text"
-                  required
-                  value={values.institutionName}
-                  onChange={(e) => onChange('institutionName', e.target.value)}
-                  placeholder="e.g. Riverside General Hospital"
-                  className={inputClass}
-                />
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {!options.skipInstitutionName && (
                 <div>
-                  <label className={labelClass}>Institution Type</label>
-                  <select
-                    required
-                    value={values.institutionType}
-                    onChange={(e) => onChange('institutionType', e.target.value)}
-                    className={inputClass}
-                  >
-                    <option value="">Select Type...</option>
-                    {INSTITUTION_TYPES.map((option) => (
-                      <option key={option} value={option}>{option}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className={labelClass}>Registration / Tax ID</label>
+                  <label className={labelClass}>Institution Name</label>
                   <input
                     type="text"
                     required
-                    value={values.registrationNumber}
-                    onChange={(e) => onChange('registrationNumber', e.target.value)}
-                    placeholder="e.g. 12-3456789"
+                    value={values.institutionName}
+                    onChange={(e) => onChange('institutionName', e.target.value)}
+                    placeholder="e.g. Riverside General Hospital"
                     className={inputClass}
                   />
                 </div>
+              )}
+
+              <div>
+                <label className={labelClass}>Institution Type</label>
+                <select
+                  required
+                  value={values.institutionType}
+                  onChange={(e) => onChange('institutionType', e.target.value)}
+                  className={inputClass}
+                >
+                  <option value="">Select Type...</option>
+                  {INSTITUTION_TYPES.map((option) => (
+                    <option key={option} value={option}>{option}</option>
+                  ))}
+                </select>
               </div>
 
               <div>
@@ -998,19 +1054,19 @@
       function renderProfessionalForm(submitLabel) {
         return (
           <form onSubmit={handleSaveProfessionalProfile} className="space-y-5">
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1">
-                {accountType === 'institution' ? 'Authorized Representative Name' : 'Full Legal Name'}
-              </label>
-              <input
-                type="text"
-                required
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-                placeholder="e.g. Alex Morgan"
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-100 focus:outline-none focus:border-cyan-500"
-              />
-            </div>
+            {accountType !== 'institution' && (
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Full Legal Name</label>
+                <input
+                  type="text"
+                  required
+                  value={fullName}
+                  onChange={(e) => setFullName(e.target.value)}
+                  placeholder="e.g. Alex Morgan"
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-100 focus:outline-none focus:border-cyan-500"
+                />
+              </div>
+            )}
 
             {renderCredentialFields(accountType, credentials, updateCredential)}
 
@@ -1035,6 +1091,7 @@
       function renderVerificationScreen() {
         const isRejected = verificationStatus === 'rejected';
         const typeLabel = accountType === 'institution' ? 'institution' : 'provider';
+        const typeWithArticle = accountType === 'institution' ? 'an institution' : 'a provider';
 
         return (
           <div className="space-y-6 max-w-2xl mx-auto">
@@ -1051,7 +1108,7 @@
                   <p className="text-xs text-slate-400 leading-relaxed">
                     {isRejected
                       ? `We were unable to verify your ${typeLabel} details. Review the note below, update your credentials, and resubmit.`
-                      : `Thanks for registering as a ${typeLabel}. Your credentials are being reviewed, and full access to the portal unlocks as soon as your account is verified.`}
+                      : `Thanks for registering as ${typeWithArticle}. Your credentials are being reviewed, and full access to the portal unlocks as soon as your account is verified.`}
                   </p>
 
                   {isRejected && verificationNotes && (
@@ -1337,6 +1394,8 @@
                 {/* TAB 1: DASHBOARD (VERIFIED PROVIDER / INSTITUTION) */}
                 {activeTab === 'dashboard' && accountType !== 'patient' && (
                   <div className="space-y-6">
+
+                    {/* Welcome banner */}
                     <div className="bg-gradient-to-r from-slate-800 via-slate-800/90 to-slate-800/70 border border-slate-700/80 rounded-2xl p-6 shadow-xl relative overflow-hidden">
                       <div className="absolute top-0 right-0 w-72 h-72 bg-cyan-500/10 rounded-full blur-3xl pointer-events-none"></div>
                       <div className="relative z-10">
@@ -1344,34 +1403,65 @@
                           {accountType === 'provider' ? 'Verified Provider' : 'Verified Institution'}
                         </span>
                         <h2 className="text-2xl font-extrabold text-white mb-1">
-                          Welcome, {(accountType === 'institution' && credentials.institutionName) || fullName || user.email}
+                          Welcome, {accountType === 'institution'
+                            ? (credentials.institutionName || fullName || user.email)
+                            : (fullName || user.email)}
                         </h2>
                         <p className="text-xs text-slate-400 max-w-xl leading-relaxed">
-                          Your verified {accountType === 'provider' ? 'professional' : 'institution'} profile is saved to your personal Supabase database and your documents are stored in your private account vault.
+                          {accountType === 'provider'
+                            ? 'Your professional credentials are verified. Your details are saved to your personal Supabase database and your documents are stored in your private account vault.'
+                            : 'Your institution is verified. Your details are saved to your personal Supabase database and your documents are stored in your private account vault.'}
                         </p>
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    {/* Credential summary */}
+                    <div className={`grid grid-cols-1 gap-4 ${accountType === 'provider' ? 'sm:grid-cols-2 lg:grid-cols-4' : 'sm:grid-cols-3'}`}>
                       {getProfessionalSummary().map(([label, value]) => (
                         <div key={label} className="bg-slate-800/60 border border-slate-700/60 rounded-xl p-4">
                           <p className="text-[11px] font-semibold uppercase text-slate-400 mb-1">{label}</p>
-                          <p className="text-sm font-bold text-slate-200 truncate" title={value || ''}>{value || 'Not Set'}</p>
+                          <p className="text-sm font-bold text-slate-200 break-words">{value || 'Not Set'}</p>
                         </div>
                       ))}
                     </div>
 
-                    <div className="bg-slate-800/40 border border-slate-800 rounded-xl p-6 flex items-center justify-between flex-wrap gap-4">
-                      <div>
-                        <h3 className="text-sm font-bold text-slate-200 mb-1">Manage Professional Profile</h3>
-                        <p className="text-xs text-slate-400">Update your credentials and contact details. Credential changes require re-verification.</p>
+                    {/* Shortcuts */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="bg-slate-800/40 border border-slate-800 rounded-xl p-6 flex items-center justify-between flex-wrap gap-4">
+                        <div>
+                          <h3 className="text-sm font-bold text-slate-200 mb-1">
+                            {accountType === 'provider' ? 'Manage Professional Profile' : 'Manage Institution Profile'}
+                          </h3>
+                          <p className="text-xs text-slate-400">
+                            {accountType === 'provider'
+                              ? 'Update your specialty and license details.'
+                              : 'Update your institution name, type and address.'}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => setActiveTab('profile')}
+                          className="px-4 py-2 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition"
+                        >
+                          {accountType === 'provider' ? 'Edit Professional Profile' : 'Edit Institution Profile'}
+                        </button>
                       </div>
-                      <button
-                        onClick={() => setActiveTab('profile')}
-                        className="px-4 py-2 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition"
-                      >
-                        Edit Professional Profile
-                      </button>
+
+                      <div className="bg-slate-800/40 border border-slate-800 rounded-xl p-6 flex items-center justify-between flex-wrap gap-4">
+                        <div>
+                          <h3 className="text-sm font-bold text-slate-200 mb-1">Document Vault</h3>
+                          <p className="text-xs text-slate-400">
+                            {accountType === 'provider'
+                              ? 'Store licenses, certifications and other documents.'
+                              : 'Store accreditations, certifications and other documents.'}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => setActiveTab('vault')}
+                          className="px-4 py-2 text-xs font-semibold bg-slate-900 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded-lg transition"
+                        >
+                          Open Vault
+                        </button>
+                      </div>
                     </div>
                   </div>
                 )}
@@ -1708,17 +1798,31 @@
 
                   {isSignUp && (
                     <div>
-                      <label className="block text-xs font-medium text-slate-400 mb-1">
-                        {authAccountType === 'institution' ? 'Authorized Representative Name' : 'Full Name'}
-                      </label>
-                      <input
-                        type="text"
-                        required
-                        value={authName}
-                        onChange={(e) => setAuthName(e.target.value)}
-                        className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-100 focus:outline-none focus:border-cyan-500"
-                        placeholder="e.g. Alex Morgan"
-                      />
+                      {authAccountType === 'institution' ? (
+                        <>
+                          <label className="block text-xs font-medium text-slate-400 mb-1">Institution Name</label>
+                          <input
+                            type="text"
+                            required
+                            value={authCredentials.institutionName}
+                            onChange={(e) => updateAuthCredential('institutionName', e.target.value)}
+                            className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-100 focus:outline-none focus:border-cyan-500"
+                            placeholder="e.g. Riverside General Hospital"
+                          />
+                        </>
+                      ) : (
+                        <>
+                          <label className="block text-xs font-medium text-slate-400 mb-1">Full Name</label>
+                          <input
+                            type="text"
+                            required
+                            value={authName}
+                            onChange={(e) => setAuthName(e.target.value)}
+                            className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-100 focus:outline-none focus:border-cyan-500"
+                            placeholder="e.g. Alex Morgan"
+                          />
+                        </>
+                      )}
                     </div>
                   )}
                   <div>
@@ -1761,7 +1865,7 @@
                   {isSignUp && requiresVerification(authAccountType) && (
                     <div className="border-t border-slate-700 pt-4 space-y-4">
                       <p className="text-[11px] font-semibold uppercase tracking-wider text-cyan-400">Verification Details</p>
-                      {renderCredentialFields(authAccountType, authCredentials, updateAuthCredential)}
+                      {renderCredentialFields(authAccountType, authCredentials, updateAuthCredential, { skipInstitutionName: true })}
                     </div>
                   )}
 
