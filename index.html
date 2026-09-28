@@ -340,6 +340,7 @@
       const [savingCredentials, setSavingCredentials] = React.useState(false);
       const [refreshingStatus, setRefreshingStatus] = React.useState(false);
       const [profileReady, setProfileReady] = React.useState(false);
+      const [setupIssue, setSetupIssue] = React.useState('');
 
       // Patients are active immediately; providers and institutions only once verified
       const canUseApp = !requiresVerification(accountType) || verificationStatus === 'verified';
@@ -417,6 +418,7 @@
         setVerificationStatus('not_required');
         setVerificationNotes('');
         setCredentials({ ...EMPTY_CREDENTIALS });
+        setSetupIssue('');
       }
 
 
@@ -441,15 +443,18 @@
           }
 
           const metadata = authUser?.user_metadata || {};
+          const signupType = metadata.account_type;
+          const rowType = data ? data.account_type : undefined;
 
-          // Database without the account-type columns: never silently treat a
-          // provider / institution as a patient.
-          const schemaMissing = !!data && !('account_type' in data);
-          if (schemaMissing) {
-            console.error('profiles.account_type is missing. Run diroa-account-types.sql in the Supabase SQL Editor.');
-          }
+          // The account signed up as a provider / institution, but the database
+          // does not record that (missing columns, an out-of-date trigger, or a
+          // profile that could not be created). Never show these accounts the
+          // patient portal, and say what is wrong.
+          const typeMismatch =
+            requiresVerification(signupType) && (!data || rowType === undefined || rowType === 'patient');
 
-          if (data && !(schemaMissing && requiresVerification(metadata.account_type))) {
+          if (data && !typeMismatch) {
+            setSetupIssue('');
             setUserProfile(data);
             setAccountType(data.account_type || 'patient');
             setVerificationStatus(data.verification_status || 'not_required');
@@ -472,10 +477,25 @@
             }
 
             // Never fail open: accounts that need verification stay locked.
-            if (requiresVerification(metadata.account_type)) {
-              setAccountType(metadata.account_type);
+            if (requiresVerification(signupType)) {
+              setAccountType(signupType);
               setVerificationStatus('pending');
+              setVerificationNotes('');
               setCredentials({ ...EMPTY_CREDENTIALS, ...(metadata.credentials || {}) });
+
+              const article = signupType === 'institution' ? 'an institution' : 'a provider';
+              let issue;
+
+              if (!data) {
+                issue = 'Your profile could not be created or read from the database. Run diroa-account-types.sql (Part 1) in the Supabase SQL Editor, check the browser console for details, then reload this page.';
+              } else if (rowType === undefined) {
+                issue = 'Your database is missing the account-type columns. Run diroa-account-types.sql (Part 1) in the Supabase SQL Editor, then reload this page.';
+              } else {
+                issue = `This account signed up as ${article}, but your database still records it as a patient. Run diroa-account-types.sql (Part 1) in the Supabase SQL Editor to update it, then reload this page.`;
+              }
+
+              console.error(issue);
+              setSetupIssue(issue);
             }
           }
         } finally {
@@ -1095,6 +1115,13 @@
 
         return (
           <div className="space-y-6 max-w-2xl mx-auto">
+            {setupIssue && (
+              <div className="bg-amber-950/40 border border-amber-800/60 rounded-xl p-4">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-amber-300 mb-1">Account setup needs attention</p>
+                <p className="text-xs text-amber-100/90 leading-relaxed">{setupIssue}</p>
+              </div>
+            )}
+
             <div className={`rounded-2xl p-6 shadow-xl border ${isRejected ? 'bg-red-950/30 border-red-900/60' : 'bg-slate-800/60 border-slate-700'}`}>
               <div className="flex items-start gap-4">
                 <div className="w-11 h-11 rounded-xl bg-slate-900 flex items-center justify-center text-xl shrink-0">
