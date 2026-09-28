@@ -352,6 +352,7 @@
       const [searching, setSearching] = React.useState(false);
       const [showSearchDropdown, setShowSearchDropdown] = React.useState(false);
       const [selectedProfile, setSelectedProfile] = React.useState(null);
+      const searchContainerRef = React.useRef(null);
 
       // -----------------------------------------------------------------------
       // AUTH MODAL
@@ -447,10 +448,20 @@
       // =========================================================================
 
       React.useEffect(() => {
-        if (user && canUseApp && activeTab === 'vault') {
-          loadVaultFiles(user.id);
+        function handleOutsideSearchClick(event) {
+          if (searchContainerRef.current && !searchContainerRef.current.contains(event.target)) {
+            setShowSearchDropdown(false);
+          }
         }
-      }, [activeTab, user, canUseApp]);
+
+        document.addEventListener('mousedown', handleOutsideSearchClick);
+        document.addEventListener('touchstart', handleOutsideSearchClick);
+
+        return () => {
+          document.removeEventListener('mousedown', handleOutsideSearchClick);
+          document.removeEventListener('touchstart', handleOutsideSearchClick);
+        };
+      }, []);
 
 
       // =========================================================================
@@ -988,11 +999,12 @@
         return { label: `${typeLabel} · Pending`, className: 'text-amber-300 bg-amber-950/60 border-amber-800/60' };
       }
 
-      async function handleProfileSearch() {
-        const term = searchTerm.trim();
+      async function handleProfileSearch(termOverride = searchTerm) {
+        const term = (termOverride || '').trim();
 
         if (!term || !user) {
           setSearchResults([]);
+          setSearching(false);
           return;
         }
 
@@ -1346,7 +1358,7 @@
               <div className="flex items-center justify-end gap-2 sm:gap-3 shrink-0">
                 {/* Header Search Trigger */}
                 {user && canUseApp && (
-                  <div className="relative">
+                  <div ref={searchContainerRef} className="relative">
                     <button
                       type="button"
                       onClick={() => setShowSearchDropdown((open) => !open)}
@@ -1381,7 +1393,15 @@
                             onChange={(e) => {
                               const value = e.target.value;
                               setSearchTerm(value);
-                              if (!value.trim()) setSearchResults([]);
+
+                              if (!value.trim()) {
+                                setSearchResults([]);
+                                setSearching(false);
+                                return;
+                              }
+
+                              // Search immediately as the user types.
+                              handleProfileSearch(value);
                             }}
                             onKeyDown={(e) => {
                               if (e.key === 'Enter') {
@@ -1428,7 +1448,7 @@
 
                         {!searching && searchTerm.trim() && searchResults.length === 0 && (
                           <div className="mt-2 rounded-xl border border-slate-800 bg-slate-900/80 px-4 py-3">
-                            <p className="text-xs text-slate-500">Press Enter or click Search to find profiles.</p>
+                            <p className="text-xs text-slate-500">No matching profiles found.</p>
                           </div>
                         )}
 
