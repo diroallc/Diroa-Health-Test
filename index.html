@@ -478,6 +478,223 @@
 
 
     // =========================================================================
+    // HEALTH PROFILE SHARING (patient -> verified provider / institution)
+    // =========================================================================
+    // Requires diroa-profile-sharing.sql to have been run in Supabase. Every
+    // rule (patients only, verified recipients only, explicit confirmation) is
+    // enforced by the database functions; the page only asks for them.
+
+    // Health-profile fields that are shared. Keys match the profiles columns
+    // and the JSON returned by get_shared_health_profiles().
+    const SHARED_PROFILE_FIELDS = [
+      { key: 'full_name', label: 'Full Name' },
+      { key: 'age', label: 'Age' },
+      { key: 'blood_type', label: 'Blood Type' },
+      { key: 'height', label: 'Height' },
+      { key: 'weight', label: 'Weight' },
+      { key: 'primary_doctor', label: 'Primary Doctor' },
+      { key: 'allergies', label: 'Known Allergies' },
+      { key: 'medications', label: 'Current Medications' },
+      { key: 'medical_condition', label: 'Current Medical Condition / Diagnosis' },
+      { key: 'emergency_contact', label: 'Emergency Contact' }
+    ];
+
+    function formatSharedValue(value) {
+      if (Array.isArray(value)) {
+        const items = value.map((item) => (item ?? '').toString().trim()).filter(Boolean);
+        return items.length ? items.join(', ') : 'Not provided';
+      }
+
+      if (value === null || value === undefined) return 'Not provided';
+
+      const text = value.toString().trim();
+      return text || 'Not provided';
+    }
+
+    function isVerifiedShareRecipient(profile) {
+      return Boolean(
+        profile &&
+        (profile.account_type === 'provider' || profile.account_type === 'institution') &&
+        profile.verification_status === 'verified'
+      );
+    }
+
+    function getAccountTypeLabel(type) {
+      if (type === 'provider') return 'Healthcare Provider';
+      if (type === 'institution') return 'Institution';
+      return 'Patient';
+    }
+
+    function describeSharingError(error, fallback) {
+      const code = error?.code || '';
+      const message = error?.message || '';
+
+      if (
+        ['42P01', '42883', 'PGRST202', 'PGRST205'].includes(code) ||
+        /could not find the (function|table)|schema cache|relation .*profile_shares.* does not exist/i.test(message)
+      ) {
+        return 'Profile sharing is not set up in the database yet. Run diroa-profile-sharing.sql in the Supabase SQL Editor, then reload this page.';
+      }
+
+      return message || fallback;
+    }
+
+    // Verified providers / institutions a patient can share with
+    async function searchShareRecipients(searchText, currentUserId) {
+      const term = (searchText || '').trim();
+
+      if (!term) {
+        return [];
+      }
+
+      const { data, error } = await supabase
+        .from('profile_directory')
+        .select(`
+          id,
+          display_name,
+          account_type,
+          verification_status,
+          specialty,
+          institution_name,
+          institution_type,
+          institution_address
+        `)
+        .ilike('display_name', `%${term}%`)
+        .neq('id', currentUserId)
+        .eq('searchable', true)
+        .in('account_type', ['provider', 'institution'])
+        .eq('verification_status', 'verified')
+        .limit(10);
+
+      if (error) {
+        console.error('Share recipient search error:', error.message);
+        throw error;
+      }
+
+      return data || [];
+    }
+
+    // The patient's active shares, with each recipient's directory profile
+    async function fetchMyProfileShares(userId) {
+      const { data, error } = await supabase
+        .from('profile_shares')
+        .select('id, recipient_id, status, patient_confirmed_at')
+        .eq('patient_id', userId)
+        .eq('status', 'active')
+        .order('patient_confirmed_at', { ascending: false });
+
+      if (error) {
+        console.error('Profile shares fetch error:', error.message);
+        throw error;
+      }
+
+      const rows = data || [];
+      let profileMap = {};
+
+      try {
+        const profiles = await fetchProfilesByIds(rows.map((row) => row.recipient_id));
+        profiles.forEach((profile) => { profileMap[profile.id] = profile; });
+      } catch (lookupError) {
+        profileMap = {};
+      }
+
+      return rows.map((row) => ({
+        ...row,
+        profile: profileMap[row.recipient_id] || null
+      }));
+    }
+
+    // Patient confirms and shares. p_confirmed is only ever sent as true from
+    // the confirmation dialog; the database rejects anything else.
+    async function shareHealthProfile(recipientId) {
+      const { data, error } = await supabase.rpc('share_health_profile', {
+        p_recipient_id: recipientId,
+        p_confirmed: true
+      });
+
+      if (error) {
+        console.error('Share profile error:', error.message);
+        throw error;
+      }
+
+      return data;
+    }
+
+    async function revokeHealthProfileShare(recipientId) {
+      const { error } = await supabase.rpc('revoke_health_profile_share', {
+        p_recipient_id: recipientId
+      });
+
+      if (error) {
+        console.error('Stop sharing error:', error.message);
+        throw error;
+      }
+    }
+
+    // Profiles shared with the signed-in verified provider / institution
+    async function fetchSharedHealthProfiles() {
+      const { data, error } = await supabase.rpc('get_shared_health_profiles');
+
+      if (error) {
+        console.error('Shared profiles fetch error:', error.message);
+        throw error;
+      }
+
+      return data || [];
+    }
+
+    // Vault uploads are named "<random id>-<original name>"; show the original
+    // name in the sharing screens.
+    function displayVaultFileName(name) {
+      const clean = (name || '').replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/i, '');
+      return clean || name || 'Untitled file';
+    }
+
+    // Files directly inside one vault folder (folder = the owner's user ID)
+    async function fetchVaultFolderFiles(folderId) {
+      const { data, error } = await supabase
+        .storage
+        .from(STORAGE_BUCKET)
+        .list(folderId, {
+          limit: 100,
+          offset: 0,
+          sortBy: { column: 'created_at', order: 'desc' }
+        });
+
+      if (error) {
+        console.error('Vault folder list error:', error.message);
+        throw error;
+      }
+
+      return (data || [])
+        .filter((file) => file.name && file.id && file.name !== '.emptyFolderPlaceholder')
+        .map((file) => ({ ...file, path: `${folderId}/${file.name}` }));
+    }
+
+    // A patient's vault files, for a verified recipient of an active share.
+    // The access check runs first so a missing database setup or an ended
+    // share is reported clearly instead of looking like an empty vault.
+    async function fetchSharedVaultFiles(patientId) {
+      const { data: allowed, error } = await supabase.rpc('can_view_shared_vault', {
+        p_patient_folder: patientId
+      });
+
+      if (error) {
+        console.error('Shared vault access check error:', error.message);
+        throw error;
+      }
+
+      if (!allowed) {
+        const denied = new Error('This patient is no longer sharing their documents with you.');
+        denied.code = 'NOT_SHARED';
+        throw denied;
+      }
+
+      return fetchVaultFolderFiles(patientId);
+    }
+
+
+    // =========================================================================
     // 5. MAIN REACT APPLICATION
     // =========================================================================
 
@@ -578,6 +795,44 @@
       const [deletingFile, setDeletingFile] = React.useState(null);
       const fileInputRef = React.useRef(null);
 
+      // -----------------------------------------------------------------------
+      // HEALTH PROFILE SHARING STATE
+      // -----------------------------------------------------------------------
+      // Patient side
+      const [myShares, setMyShares] = React.useState([]);
+      const [mySharesLoaded, setMySharesLoaded] = React.useState(false);
+      const [mySharesLoading, setMySharesLoading] = React.useState(false);
+      const [shareSearchTerm, setShareSearchTerm] = React.useState('');
+      const [shareSearchResults, setShareSearchResults] = React.useState([]);
+      const [shareSearching, setShareSearching] = React.useState(false);
+      const [shareTarget, setShareTarget] = React.useState(null);
+      const [shareConsent, setShareConsent] = React.useState(false);
+      const [sharingInProgress, setSharingInProgress] = React.useState(false);
+      const [revokingShareId, setRevokingShareId] = React.useState(null);
+      const [shareError, setShareError] = React.useState('');
+      const [shareNotice, setShareNotice] = React.useState('');
+      const [shareConfirmError, setShareConfirmError] = React.useState('');
+      const mySharesRequestRef = React.useRef(0);
+      const sharedWithMeRequestRef = React.useRef(0);
+
+      // Verified provider / institution side
+      const [sharedWithMe, setSharedWithMe] = React.useState([]);
+      const [sharedWithMeLoaded, setSharedWithMeLoaded] = React.useState(false);
+      const [sharedWithMeLoading, setSharedWithMeLoading] = React.useState(false);
+      const [sharedWithMeError, setSharedWithMeError] = React.useState('');
+      const [viewingSharedProfile, setViewingSharedProfile] = React.useState(null);
+
+      // Medical Vault documents that travel with a share
+      const [shareVaultPreview, setShareVaultPreview] = React.useState([]);
+      const [shareVaultPreviewLoading, setShareVaultPreviewLoading] = React.useState(false);
+      const [shareVaultPreviewError, setShareVaultPreviewError] = React.useState('');
+      const [sharedVaultFiles, setSharedVaultFiles] = React.useState([]);
+      const [sharedVaultLoading, setSharedVaultLoading] = React.useState(false);
+      const [sharedVaultError, setSharedVaultError] = React.useState('');
+      const [openingSharedFile, setOpeningSharedFile] = React.useState(null);
+
+      const sharingTabLabel = accountType === 'patient' ? 'Sharing' : 'Shared Profiles';
+
 
       // =========================================================================
       // 6. INITIAL AUTH SESSION
@@ -610,6 +865,25 @@
             setConversationMessages([]);
             hasLoadedConversationsRef.current = false;
             messagesLoadedForRef.current = {};
+            mySharesRequestRef.current += 1;
+            sharedWithMeRequestRef.current += 1;
+            setMyShares([]);
+            setMySharesLoaded(false);
+            setShareConfirmError('');
+            setShareSearchTerm('');
+            setShareSearchResults([]);
+            setShareTarget(null);
+            setShareConsent(false);
+            setShareError('');
+            setShareNotice('');
+            setSharedWithMe([]);
+            setSharedWithMeLoaded(false);
+            setSharedWithMeError('');
+            setViewingSharedProfile(null);
+            setShareVaultPreview([]);
+            setShareVaultPreviewError('');
+            setSharedVaultFiles([]);
+            setSharedVaultError('');
           }
         });
 
@@ -826,6 +1100,315 @@
           }, 0);
         }
       }, [conversationMessages.length]);
+
+
+      // =========================================================================
+      // 9b. HEALTH PROFILE SHARING: LOADERS & EFFECTS
+      // =========================================================================
+      // Each loader ignores responses from requests that were superseded
+      // (a newer load, or sign-out), so fast tab switches never show stale data.
+
+      async function loadMyShares() {
+        if (!user) return;
+
+        const requestId = ++mySharesRequestRef.current;
+        setMySharesLoading(true);
+
+        try {
+          const rows = await fetchMyProfileShares(user.id);
+          if (requestId !== mySharesRequestRef.current) return;
+
+          setMyShares(rows);
+          setMySharesLoaded(true);
+          setShareError('');
+        } catch (error) {
+          if (requestId !== mySharesRequestRef.current) return;
+          setShareError(describeSharingError(error, 'Could not load who you are sharing with.'));
+        } finally {
+          if (requestId === mySharesRequestRef.current) setMySharesLoading(false);
+        }
+      }
+
+      async function loadSharedWithMe() {
+        if (!user) return;
+
+        const requestId = ++sharedWithMeRequestRef.current;
+        setSharedWithMeLoading(true);
+
+        try {
+          const rows = await fetchSharedHealthProfiles();
+          if (requestId !== sharedWithMeRequestRef.current) return;
+
+          setSharedWithMe(rows);
+          setSharedWithMeLoaded(true);
+          setSharedWithMeError('');
+
+          // If the open profile is no longer shared, close it.
+          setViewingSharedProfile((previous) =>
+            previous ? (rows.find((row) => row.patient_id === previous.patient_id) || null) : previous
+          );
+        } catch (error) {
+          if (requestId !== sharedWithMeRequestRef.current) return;
+          setSharedWithMeError(describeSharingError(error, 'Could not load shared health profiles.'));
+        } finally {
+          if (requestId === sharedWithMeRequestRef.current) setSharedWithMeLoading(false);
+        }
+      }
+
+      // Patients: keep the list of who they share with current (used by the
+      // Sharing tab, the dashboard card and the profile pop-up).
+      React.useEffect(() => {
+        if (!user || !profileReady || !canUseApp || accountType !== 'patient') return;
+        loadMyShares();
+      }, [user?.id, profileReady, canUseApp, accountType, activeTab]);
+
+      // Verified providers / institutions: load shared profiles on the
+      // dashboard and the Shared Profiles tab.
+      React.useEffect(() => {
+        if (!user || !profileReady || !canUseApp || accountType === 'patient') return;
+        if (activeTab !== 'sharing' && activeTab !== 'dashboard') return;
+        loadSharedWithMe();
+      }, [user?.id, profileReady, canUseApp, accountType, activeTab]);
+
+      // Patients: search verified providers / institutions as they type
+      React.useEffect(() => {
+        if (!user || !canUseApp || accountType !== 'patient' || activeTab !== 'sharing') return;
+
+        const term = shareSearchTerm.trim();
+
+        if (!term) {
+          setShareSearchResults([]);
+          setShareSearching(false);
+          return;
+        }
+
+        let cancelled = false;
+        setShareSearching(true);
+
+        const timer = window.setTimeout(async () => {
+          try {
+            const results = await searchShareRecipients(term, user.id);
+            if (!cancelled) setShareSearchResults(results);
+          } catch (error) {
+            if (!cancelled) {
+              setShareSearchResults([]);
+              setShareError(describeSharingError(error, 'Search failed. Please try again.'));
+            }
+          } finally {
+            if (!cancelled) setShareSearching(false);
+          }
+        }, 250);
+
+        return () => {
+          cancelled = true;
+          window.clearTimeout(timer);
+        };
+      }, [shareSearchTerm, user?.id, canUseApp, accountType, activeTab]);
+
+      // Patients: list their own vault documents in the confirmation dialog,
+      // so they see exactly which files will be shared.
+      React.useEffect(() => {
+        if (!user || !shareTarget) {
+          setShareVaultPreview([]);
+          setShareVaultPreviewError('');
+          setShareVaultPreviewLoading(false);
+          return;
+        }
+
+        let cancelled = false;
+        setShareVaultPreview([]);
+        setShareVaultPreviewError('');
+        setShareVaultPreviewLoading(true);
+
+        fetchVaultFolderFiles(user.id)
+          .then((files) => { if (!cancelled) setShareVaultPreview(files); })
+          .catch(() => {
+            if (!cancelled) setShareVaultPreviewError('Could not list your vault documents right now. All of them will still be shared.');
+          })
+          .finally(() => { if (!cancelled) setShareVaultPreviewLoading(false); });
+
+        return () => { cancelled = true; };
+      }, [shareTarget?.id, user?.id]);
+
+      // Verified providers / institutions: load the patient's vault documents
+      // when a shared profile is opened.
+      React.useEffect(() => {
+        const patientId = viewingSharedProfile?.patient_id;
+
+        if (!user || !patientId) {
+          setSharedVaultFiles([]);
+          setSharedVaultError('');
+          setSharedVaultLoading(false);
+          return;
+        }
+
+        let cancelled = false;
+        setSharedVaultFiles([]);
+        setSharedVaultError('');
+        setSharedVaultLoading(true);
+
+        fetchSharedVaultFiles(patientId)
+          .then((files) => { if (!cancelled) setSharedVaultFiles(files); })
+          .catch((error) => {
+            if (cancelled) return;
+            const code = error?.code || '';
+            if (['42883', 'PGRST202'].includes(code) || /could not find the function/i.test(error?.message || '')) {
+              setSharedVaultError('Document sharing is not set up in the database yet. Run the latest diroa-profile-sharing.sql in the Supabase SQL Editor, then reload this page.');
+            } else {
+              setSharedVaultError(error?.message || 'Could not load this patient’s documents.');
+            }
+          })
+          .finally(() => { if (!cancelled) setSharedVaultLoading(false); });
+
+        return () => { cancelled = true; };
+      }, [viewingSharedProfile?.patient_id, user?.id]);
+
+
+      // =========================================================================
+      // 9c. HEALTH PROFILE SHARING: ACTIONS
+      // =========================================================================
+
+      function findActiveShare(recipientId) {
+        return myShares.find((share) => share.recipient_id === recipientId) || null;
+      }
+
+      function openShareConfirmation(profile) {
+        if (accountType !== 'patient' || !canUseApp || !isVerifiedShareRecipient(profile)) return;
+
+        setSelectedProfile(null);
+        setShareConsent(false);
+        setShareConfirmError('');
+        setShareTarget(profile);
+      }
+
+      function closeShareConfirmation() {
+        if (sharingInProgress) return;
+
+        setShareTarget(null);
+        setShareConsent(false);
+        setShareConfirmError('');
+      }
+
+      async function handleConfirmShare() {
+        if (!user || !shareTarget || !shareConsent || sharingInProgress) return;
+
+        const target = shareTarget;
+        const name = target.display_name || 'this account';
+
+        setSharingInProgress(true);
+        setShareConfirmError('');
+
+        try {
+          await shareHealthProfile(target.id);
+
+          setShareTarget(null);
+          setShareConsent(false);
+          setShareError('');
+          setShareNotice(`Your health profile and Medical Vault documents are now shared with ${name}. You can stop sharing at any time.`);
+          setShareSearchTerm('');
+          setShareSearchResults([]);
+          setActiveTab('sharing');
+          await loadMyShares();
+        } catch (error) {
+          setShareConfirmError(describeSharingError(error, 'Your health profile could not be shared.'));
+        } finally {
+          setSharingInProgress(false);
+        }
+      }
+
+      async function handleStopSharing(share) {
+        if (!user || !share?.recipient_id || revokingShareId) return;
+
+        const name = share.profile?.display_name || 'this account';
+        const confirmed = window.confirm(
+          `Stop sharing your health profile and Medical Vault documents with ${name}?\n\nThey lose access right away. Anything they have already viewed or downloaded cannot be taken back.`
+        );
+        if (!confirmed) return;
+
+        setRevokingShareId(share.recipient_id);
+        setShareError('');
+        setShareNotice('');
+
+        try {
+          await revokeHealthProfileShare(share.recipient_id);
+          setMyShares((previous) => previous.filter((item) => item.recipient_id !== share.recipient_id));
+          setShareNotice(`You stopped sharing your health profile and documents with ${name}.`);
+          loadMyShares();
+        } catch (error) {
+          setShareError(describeSharingError(error, 'Could not stop sharing. Please try again.'));
+        } finally {
+          setRevokingShareId(null);
+        }
+      }
+
+      function openSharedProfile(entry) {
+        if (!entry?.patient_id) return;
+
+        setViewingSharedProfile(entry);
+        // Re-check access in the background; the view closes if the patient
+        // has stopped sharing since the list was loaded.
+        loadSharedWithMe();
+      }
+
+      function messageSharedPatient(entry) {
+        if (!entry?.patient_id) return;
+
+        setViewingSharedProfile(null);
+        openConversationWithProfile({
+          id: entry.patient_id,
+          display_name: entry.profile?.full_name || 'Patient',
+          account_type: 'patient',
+          verification_status: 'not_required'
+        });
+      }
+
+      // Opens a shared document through a short-lived signed link. The storage
+      // policy only issues the link while the share is active and verified.
+      async function handleOpenSharedVaultFile(file) {
+        if (!user || !file?.path || openingSharedFile) return;
+
+        setOpeningSharedFile(file.path);
+        setSharedVaultError('');
+
+        try {
+          const { data, error } = await supabase
+            .storage
+            .from(STORAGE_BUCKET)
+            .createSignedUrl(file.path, 60 * 5);
+
+          if (error) {
+            console.error('Shared file link error:', error.message);
+            setSharedVaultError('Could not open this document. The patient may have stopped sharing or removed it.');
+            return;
+          }
+
+          if (data?.signedUrl) {
+            window.open(data.signedUrl, '_blank', 'noopener,noreferrer');
+          }
+        } catch (error) {
+          console.error('Shared file open error:', error);
+          setSharedVaultError('Could not open this document.');
+        } finally {
+          setOpeningSharedFile(null);
+        }
+      }
+
+      function formatShareDate(timestamp) {
+        if (!timestamp) return '';
+
+        return new Date(timestamp).toLocaleDateString(undefined, {
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric'
+        });
+      }
+
+      function getRecipientDetail(profile) {
+        if (!profile) return '';
+        if (profile.account_type === 'provider') return profile.specialty || '';
+        if (profile.account_type === 'institution') return profile.institution_type || '';
+        return '';
+      }
 
 
       // =========================================================================
@@ -1718,6 +2301,560 @@
 
 
       // =========================================================================
+      // 16d. HEALTH PROFILE SHARING UI
+      // =========================================================================
+
+      function renderInitialAvatar(name, sizeClass = 'w-9 h-9 text-xs') {
+        return (
+          <div className={`${sizeClass} rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center shrink-0 font-bold text-cyan-400`}>
+            {(name || '?').trim().charAt(0).toUpperCase() || '?'}
+          </div>
+        );
+      }
+
+      // Patient: find a verified recipient, see who has access, stop sharing
+      function renderPatientSharingTab() {
+        const term = shareSearchTerm.trim();
+
+        return (
+          <div className="space-y-6">
+            <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
+              <h2 className="text-xl font-bold text-white mb-1">Share Your Health Profile</h2>
+              <p className="text-xs text-slate-400 mb-4 leading-relaxed max-w-2xl">
+                Give a verified provider or institution read-only access to your health profile and Medical Vault documents. Nothing is shared until you review and confirm, and you can stop sharing at any time.
+              </p>
+
+              <div className="mb-5 grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="rounded-lg border border-slate-700 bg-slate-900/50 p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-cyan-400 mb-1">Shared</p>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    {SHARED_PROFILE_FIELDS.map((field) => field.label).join(', ')}, and your Medical Vault documents (view and download only)
+                  </p>
+                </div>
+                <div className="rounded-lg border border-slate-700 bg-slate-900/50 p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1">Never shared</p>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    Your email address and messages
+                  </p>
+                </div>
+              </div>
+
+              {shareNotice && (
+                <div className="mb-4 rounded-lg border border-emerald-800/60 bg-emerald-950/30 px-4 py-3 flex items-start justify-between gap-3">
+                  <p className="text-xs text-emerald-200 leading-relaxed">{shareNotice}</p>
+                  <button
+                    type="button"
+                    onClick={() => setShareNotice('')}
+                    aria-label="Dismiss"
+                    className="text-emerald-300/70 hover:text-emerald-100 text-base leading-none shrink-0"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+
+              {shareError && (
+                <div className="mb-4 rounded-lg border border-red-900/60 bg-red-950/30 px-4 py-3">
+                  <p className="text-xs text-red-300 leading-relaxed">{shareError}</p>
+                </div>
+              )}
+
+              <label className="block text-xs font-medium text-slate-400 mb-1">Find a verified provider or institution</label>
+              <div className="group flex items-center min-h-11 rounded-xl border border-slate-700/80 bg-slate-900/90 transition focus-within:border-cyan-500/70 focus-within:ring-2 focus-within:ring-cyan-500/10">
+                <span className="pl-3.5 text-slate-500 group-focus-within:text-cyan-400 transition shrink-0">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-4 h-4">
+                    <circle cx="11" cy="11" r="7" />
+                    <path d="m20 20-4-4" />
+                  </svg>
+                </span>
+                <input
+                  type="text"
+                  value={shareSearchTerm}
+                  onChange={(e) => setShareSearchTerm(e.target.value)}
+                  placeholder="Search by name..."
+                  autoComplete="off"
+                  spellCheck="false"
+                  className="flex-1 min-w-0 bg-transparent px-3 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none"
+                />
+                {shareSearchTerm && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShareSearchTerm('');
+                      setShareSearchResults([]);
+                    }}
+                    className="mr-1.5 w-7 h-7 flex items-center justify-center rounded-lg text-slate-500 hover:text-slate-200 hover:bg-slate-800 transition shrink-0"
+                    aria-label="Clear search"
+                  >
+                    <span className="text-base leading-none">×</span>
+                  </button>
+                )}
+              </div>
+
+              {shareSearching && (
+                <p className="mt-3 text-xs text-slate-400">Searching verified providers and institutions...</p>
+              )}
+
+              {!shareSearching && term && shareSearchResults.length === 0 && (
+                <p className="mt-3 text-xs text-slate-500">No verified providers or institutions match "{term}".</p>
+              )}
+
+              {shareSearchResults.length > 0 && (
+                <div className="mt-3 overflow-hidden rounded-xl border border-slate-800 bg-slate-900/60">
+                  {shareSearchResults.map((profile) => {
+                    const detail = getRecipientDetail(profile);
+                    const alreadyShared = Boolean(findActiveShare(profile.id));
+
+                    return (
+                      <div key={profile.id} className="flex items-center gap-3 px-4 py-3 border-b border-slate-800 last:border-b-0">
+                        {renderInitialAvatar(profile.display_name)}
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm font-semibold text-white truncate">{profile.display_name || 'Unnamed Account'}</p>
+                          <p className="text-[10px] text-slate-400 mt-0.5 truncate">
+                            {getAccountTypeLabel(profile.account_type)}
+                            {detail ? ` · ${detail}` : ''}
+                            <span className="text-emerald-400"> · ✓ Verified</span>
+                          </p>
+                        </div>
+                        {alreadyShared ? (
+                          <span className="shrink-0 px-2.5 py-1 text-[10px] font-semibold text-emerald-300 bg-emerald-950/40 border border-emerald-800/60 rounded-lg">
+                            Shared
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => openShareConfirmation(profile)}
+                            className="shrink-0 px-3 py-1.5 text-[11px] font-semibold bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition"
+                          >
+                            Share
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
+              <div className="flex items-start justify-between gap-3 mb-5">
+                <div>
+                  <h3 className="text-sm font-bold text-white">Who Can See Your Health Profile</h3>
+                  <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
+                    Each of these sees your latest saved profile and your Medical Vault documents, read-only, until you stop sharing.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => loadMyShares()}
+                  disabled={mySharesLoading}
+                  className="shrink-0 px-3 py-1.5 text-[10px] font-semibold bg-slate-900 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-300 disabled:opacity-50"
+                >
+                  {mySharesLoading ? 'Refreshing...' : 'Refresh'}
+                </button>
+              </div>
+
+              {!mySharesLoaded ? (
+                <div className="text-center py-8 border border-slate-800 rounded-xl bg-slate-900/30">
+                  <p className="text-xs text-slate-500">
+                    {mySharesLoading ? 'Loading your sharing settings...' : 'Sharing details are unavailable right now.'}
+                  </p>
+                </div>
+              ) : myShares.length === 0 ? (
+                <div className="text-center py-10 border border-slate-800 rounded-xl bg-slate-900/30">
+                  <div className="text-2xl mb-2">🔒</div>
+                  <p className="text-xs font-semibold text-slate-300">Your health profile is private</p>
+                  <p className="text-[10px] text-slate-500 mt-1">It is not shared with anyone. Search above to share it with a verified provider or institution.</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {myShares.map((share) => {
+                    const profile = share.profile;
+                    const name = profile?.display_name || 'Unknown Account';
+                    const detail = getRecipientDetail(profile);
+                    const stillVerified = !profile || profile.verification_status === 'verified';
+
+                    return (
+                      <div key={share.recipient_id} className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex items-center gap-4 flex-wrap sm:flex-nowrap">
+                        {renderInitialAvatar(name, 'w-10 h-10 text-sm')}
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-semibold text-slate-200 truncate">{name}</p>
+                          <p className="text-[10px] text-slate-500 mt-1">
+                            {profile ? getAccountTypeLabel(profile.account_type) : 'Provider / Institution'}
+                            {detail ? ` · ${detail}` : ''}
+                            {` · Shared since ${formatShareDate(share.patient_confirmed_at)}`}
+                          </p>
+                          {!stillVerified && (
+                            <p className="text-[10px] text-amber-300 mt-1">
+                              No longer verified. They cannot open your profile unless they are verified again.
+                            </p>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleStopSharing(share)}
+                          disabled={Boolean(revokingShareId)}
+                          className="shrink-0 px-3 py-1.5 text-[10px] font-semibold bg-slate-800 hover:bg-red-900/50 text-red-400 border border-slate-700 hover:border-red-800 rounded-lg transition disabled:opacity-50"
+                        >
+                          {revokingShareId === share.recipient_id ? 'Stopping...' : 'Stop Sharing'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      // Patient: explicit review-and-confirm step before anything is shared
+      function renderShareConfirmModal() {
+        const target = shareTarget;
+        const name = target.display_name || 'this account';
+        const detail = getRecipientDetail(target);
+        const preview = SHARED_PROFILE_FIELDS.map((field) => ({
+          ...field,
+          value: formatSharedValue(userProfile?.[field.key])
+        }));
+        const filledCount = preview.filter((item) => item.key !== 'full_name' && item.value !== 'Not provided').length;
+
+        return (
+          <div
+            className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-50"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="share-confirm-title"
+          >
+            <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto shadow-2xl relative">
+              <button
+                type="button"
+                onClick={closeShareConfirmation}
+                disabled={sharingInProgress}
+                aria-label="Close"
+                className="absolute top-4 right-4 text-slate-400 hover:text-white text-sm disabled:opacity-40"
+              >
+                ✕
+              </button>
+
+              <h3 id="share-confirm-title" className="text-lg font-bold text-white mb-1 pr-6">Confirm Health Profile Sharing</h3>
+              <p className="text-xs text-slate-400 leading-relaxed">Review exactly what will be shared before you confirm.</p>
+
+              <div className="mt-5 flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-900/60 p-4">
+                {renderInitialAvatar(name, 'w-10 h-10 text-sm')}
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-white truncate">{name}</p>
+                  <p className="text-[10px] text-slate-400 mt-0.5">
+                    {getAccountTypeLabel(target.account_type)}
+                    {detail ? ` · ${detail}` : ''}
+                    <span className="text-emerald-400"> · ✓ Diroa Verified</span>
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-5">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-cyan-400 mb-2">They will be able to see</p>
+                <div className="rounded-xl border border-slate-700 bg-slate-900/60 divide-y divide-slate-800">
+                  {preview.map((item) => (
+                    <div key={item.key} className="flex items-start justify-between gap-4 px-4 py-2.5">
+                      <p className="text-[11px] text-slate-500 shrink-0 w-32 sm:w-40">{item.label}</p>
+                      <p className={`text-xs text-right break-words min-w-0 ${item.value === 'Not provided' ? 'text-slate-600 italic' : 'text-slate-200'}`}>
+                        {item.value}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+                {filledCount === 0 && (
+                  <p className="text-[10px] text-amber-300 mt-2 leading-relaxed">
+                    Your health profile is mostly empty. You can still share it, but you may want to fill it in under Edit Profile first.
+                  </p>
+                )}
+              </div>
+
+              <div className="mt-5">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-cyan-400 mb-2">
+                  Medical Vault documents{!shareVaultPreviewLoading && !shareVaultPreviewError ? ` (${shareVaultPreview.length})` : ''}
+                </p>
+                <div className="rounded-xl border border-slate-700 bg-slate-900/60">
+                  {shareVaultPreviewLoading ? (
+                    <p className="px-4 py-3 text-xs text-slate-500">Loading your documents...</p>
+                  ) : shareVaultPreviewError ? (
+                    <p className="px-4 py-3 text-xs text-amber-300 leading-relaxed">{shareVaultPreviewError}</p>
+                  ) : shareVaultPreview.length === 0 ? (
+                    <p className="px-4 py-3 text-xs text-slate-500 leading-relaxed">Your vault is empty right now. Documents you upload later will be shared too.</p>
+                  ) : (
+                    <div className="max-h-40 overflow-y-auto divide-y divide-slate-800">
+                      {shareVaultPreview.map((file) => (
+                        <div key={file.path} className="flex items-center gap-3 px-4 py-2">
+                          <span className="text-sm shrink-0">{getFileIcon(file.name)}</span>
+                          <p className="text-xs text-slate-200 truncate min-w-0 flex-1" title={displayVaultFileName(file.name)}>
+                            {displayVaultFileName(file.name)}
+                          </p>
+                          <span className="text-[10px] text-slate-500 shrink-0">{formatFileSize(file.metadata?.size)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <ul className="mt-4 space-y-1.5 text-[11px] text-slate-400 leading-relaxed list-disc pl-4">
+                <li>Access is read-only. They cannot change your profile.</li>
+                <li>They see your latest saved profile, including future updates, until you stop sharing.</li>
+                <li>All of your Medical Vault documents are included, along with any you upload later. They can open and download them, but cannot upload, change or delete anything.</li>
+                <li>Your email address and messages are not shared.</li>
+                <li>You can stop sharing at any time from the Sharing tab. Anything they have already viewed or downloaded cannot be taken back.</li>
+              </ul>
+
+              <label className="mt-5 flex items-start gap-3 rounded-lg border border-slate-700 bg-slate-900/60 p-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={shareConsent}
+                  onChange={(e) => setShareConsent(e.target.checked)}
+                  disabled={sharingInProgress}
+                  className="mt-0.5 h-4 w-4 accent-cyan-500 shrink-0"
+                />
+                <span className="text-xs text-slate-200 leading-relaxed">
+                  I confirm that I want to share my health profile and Medical Vault documents with <span className="font-semibold">{name}</span>.
+                </span>
+              </label>
+
+              {shareConfirmError && (
+                <p className="text-xs text-red-400 mt-3 leading-relaxed">{shareConfirmError}</p>
+              )}
+
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={closeShareConfirmation}
+                  disabled={sharingInProgress}
+                  className="px-4 py-2 text-xs font-semibold bg-slate-900 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded-lg transition disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmShare}
+                  disabled={!shareConsent || sharingInProgress}
+                  className="px-4 py-2 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition shadow-md shadow-cyan-900/30 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {sharingInProgress ? 'Sharing...' : 'Confirm & Share'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      // Verified provider / institution: list of patients who shared with them
+      function renderSharedProfilesTab() {
+        return (
+          <div className="space-y-6">
+            <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
+              <div className="flex items-start justify-between gap-3 mb-5">
+                <div>
+                  <h2 className="text-xl font-bold text-white mb-1">Shared Health Profiles</h2>
+                  <p className="text-xs text-slate-400 leading-relaxed max-w-2xl">
+                    Patients who have chosen to share their health profile and Medical Vault documents with you. Access is read-only and ends as soon as a patient stops sharing.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => loadSharedWithMe()}
+                  disabled={sharedWithMeLoading}
+                  className="shrink-0 px-3 py-1.5 text-[10px] font-semibold bg-slate-900 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-300 disabled:opacity-50"
+                >
+                  {sharedWithMeLoading ? 'Refreshing...' : 'Refresh'}
+                </button>
+              </div>
+
+              {sharedWithMeError && (
+                <div className="mb-4 rounded-lg border border-red-900/60 bg-red-950/30 px-4 py-3">
+                  <p className="text-xs text-red-300 leading-relaxed">{sharedWithMeError}</p>
+                </div>
+              )}
+
+              {!sharedWithMeLoaded ? (
+                <div className="text-center py-10 border border-slate-800 rounded-xl bg-slate-900/30">
+                  <p className="text-xs text-slate-500">
+                    {sharedWithMeLoading ? 'Loading shared health profiles...' : 'Shared health profiles are unavailable right now.'}
+                  </p>
+                </div>
+              ) : sharedWithMe.length === 0 ? (
+                <div className="text-center py-10 border border-slate-800 rounded-xl bg-slate-900/30">
+                  <div className="text-2xl mb-2">📋</div>
+                  <p className="text-xs font-semibold text-slate-300">No shared profiles yet</p>
+                  <p className="text-[10px] text-slate-500 mt-1 max-w-sm mx-auto leading-relaxed">
+                    When a patient confirms they want to share their health profile with you, it appears here.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {sharedWithMe.map((entry) => {
+                    const name = entry.profile?.full_name || 'Unnamed Patient';
+
+                    return (
+                      <div key={entry.patient_id} className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex items-center gap-4 flex-wrap sm:flex-nowrap">
+                        {renderInitialAvatar(name, 'w-10 h-10 text-sm')}
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-semibold text-slate-200 truncate">{name}</p>
+                          <p className="text-[10px] text-slate-500 mt-1">Shared with you on {formatShareDate(entry.shared_at)}</p>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => openSharedProfile(entry)}
+                            className="px-3 py-1.5 text-[10px] font-semibold bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition"
+                          >
+                            View Profile
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => messageSharedPatient(entry)}
+                            className="px-3 py-1.5 text-[10px] font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded-lg transition"
+                          >
+                            Message
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      // Verified provider / institution: read-only view of one shared profile
+      function renderSharedProfileModal() {
+        const entry = viewingSharedProfile;
+        const profile = entry.profile || {};
+        const name = profile.full_name || 'Unnamed Patient';
+        const fields = SHARED_PROFILE_FIELDS.filter((field) => field.key !== 'full_name');
+
+        return (
+          <div
+            className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-50"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="shared-profile-title"
+          >
+            <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto shadow-2xl relative">
+              <button
+                type="button"
+                onClick={() => setViewingSharedProfile(null)}
+                aria-label="Close"
+                className="absolute top-4 right-4 text-slate-400 hover:text-white text-sm"
+              >
+                ✕
+              </button>
+
+              <span className="inline-block px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-cyan-400 bg-cyan-950/80 border border-cyan-800/60 rounded-full mb-3">
+                Shared by Patient · Read-only
+              </span>
+
+              <div className="flex items-center gap-3">
+                {renderInitialAvatar(name, 'w-11 h-11 text-sm')}
+                <div className="min-w-0">
+                  <h3 id="shared-profile-title" className="text-lg font-bold text-white truncate pr-6">{name}</h3>
+                  <p className="text-[10px] text-slate-400 mt-0.5">
+                    Shared with you on {formatShareDate(entry.shared_at)}
+                    {profile.updated_at ? ` · Profile updated ${formatShareDate(profile.updated_at)}` : ''}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {fields.map((field) => {
+                  const value = formatSharedValue(profile[field.key]);
+                  const wide = ['allergies', 'medications', 'medical_condition', 'emergency_contact'].includes(field.key);
+
+                  return (
+                    <div key={field.key} className={`bg-slate-900/60 border border-slate-700 rounded-xl p-3.5 ${wide ? 'sm:col-span-2' : ''}`}>
+                      <p className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">{field.label}</p>
+                      <p className={`text-sm break-words whitespace-pre-wrap ${value === 'Not provided' ? 'text-slate-600 italic' : 'text-slate-200'}`}>{value}</p>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="mt-5">
+                <div className="flex items-center justify-between gap-3 mb-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-cyan-400">
+                    Medical Vault Documents{!sharedVaultLoading && !sharedVaultError ? ` (${sharedVaultFiles.length})` : ''}
+                  </p>
+                  <p className="text-[10px] text-slate-500">View &amp; download only</p>
+                </div>
+
+                {sharedVaultLoading ? (
+                  <div className="text-center py-6 border border-slate-700 rounded-xl bg-slate-900/40">
+                    <p className="text-xs text-slate-500">Loading documents...</p>
+                  </div>
+                ) : sharedVaultError ? (
+                  <div className="rounded-xl border border-red-900/60 bg-red-950/30 px-4 py-3">
+                    <p className="text-xs text-red-300 leading-relaxed">{sharedVaultError}</p>
+                  </div>
+                ) : sharedVaultFiles.length === 0 ? (
+                  <div className="text-center py-6 border border-slate-700 rounded-xl bg-slate-900/40">
+                    <p className="text-xs text-slate-500">This patient has no documents in their vault yet.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {sharedVaultFiles.map((file) => (
+                      <div key={file.path} className="bg-slate-900/60 border border-slate-700 rounded-xl p-3 flex items-center gap-3">
+                        <div className="w-9 h-9 rounded-lg bg-slate-800 flex items-center justify-center text-base shrink-0">
+                          {getFileIcon(file.name)}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-semibold text-slate-200 truncate" title={displayVaultFileName(file.name)}>
+                            {displayVaultFileName(file.name)}
+                          </p>
+                          <p className="text-[10px] text-slate-500 mt-0.5">
+                            {formatFileSize(file.metadata?.size)} • {formatFileDate(file.created_at)}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleOpenSharedVaultFile(file)}
+                          disabled={Boolean(openingSharedFile)}
+                          className="shrink-0 px-3 py-1.5 text-[10px] font-semibold bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition disabled:opacity-50"
+                        >
+                          {openingSharedFile === file.path ? 'Opening...' : 'Open'}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <p className="mt-4 text-[10px] text-slate-500 leading-relaxed">
+                This patient chose to share this information and these documents with you. Your access ends automatically if they stop sharing.
+              </p>
+
+              <div className="mt-5 pt-5 border-t border-slate-700 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setViewingSharedProfile(null)}
+                  className="px-4 py-2 text-xs font-semibold bg-slate-900 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded-lg transition"
+                >
+                  Close
+                </button>
+                <button
+                  type="button"
+                  onClick={() => messageSharedPatient(entry)}
+                  className="px-4 py-2 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition shadow-md shadow-cyan-900/30"
+                >
+                  Message {name}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+
+      // =========================================================================
       // 17. HELPER FUNCTIONS FOR THE VAULT UI
       // =========================================================================
 
@@ -1812,6 +2949,18 @@
                       className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg transition ${activeTab === 'vault' ? 'bg-cyan-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'}`}
                     >
                       Medical Vault
+                    </button>
+                    <button
+                      onClick={() => setActiveTab('sharing')}
+                      className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg transition ${activeTab === 'sharing' ? 'bg-cyan-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'}`}
+                    >
+                      {accountType === 'patient' ? sharingTabLabel : (
+                        <>
+                          {/* Short label where the header is narrowest, so it never crowds the logo */}
+                          <span className="xl:hidden">Shared</span>
+                          <span className="hidden xl:inline">{sharingTabLabel}</span>
+                        </>
+                      )}
                     </button>
                   </div>
                 </nav>
@@ -1980,7 +3129,7 @@
 
           {/* Mobile Navigation */}
           {user && canUseApp && (
-            <div className="flex lg:hidden bg-slate-950 border-b border-slate-800 p-2 justify-around">
+            <div className="flex lg:hidden bg-slate-950 border-b border-slate-800 p-2 justify-between sm:justify-around gap-1 overflow-x-auto [&>button]:shrink-0 [&>button]:whitespace-nowrap">
               <button
                 onClick={() => setActiveTab('dashboard')}
                 className={`px-3 py-1.5 text-xs font-semibold rounded-lg ${activeTab === 'dashboard' ? 'bg-cyan-600 text-white' : 'text-slate-400'}`}
@@ -2004,6 +3153,12 @@
                 className={`px-3 py-1.5 text-xs font-semibold rounded-lg ${activeTab === 'vault' ? 'bg-cyan-600 text-white' : 'text-slate-400'}`}
               >
                 Medical Vault
+              </button>
+              <button
+                onClick={() => setActiveTab('sharing')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-lg ${activeTab === 'sharing' ? 'bg-cyan-600 text-white' : 'text-slate-400'}`}
+              >
+                {sharingTabLabel}
               </button>
             </div>
           )}
@@ -2109,6 +3264,26 @@
                         Edit Health Profile
                       </button>
                     </div>
+
+                    {/* Profile Sharing summary */}
+                    <div className="bg-slate-800/40 border border-slate-800 rounded-xl p-6 flex items-center justify-between flex-wrap gap-4">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-200 mb-1">Profile Sharing</h3>
+                        <p className="text-xs text-slate-400">
+                          {!mySharesLoaded
+                            ? 'Share your health profile and Medical Vault documents with verified providers and institutions. Nothing is shared until you confirm.'
+                            : myShares.length === 0
+                              ? 'Your health profile is private. Nothing is shared until you confirm.'
+                              : `Your health profile and documents are shared with ${myShares.length} verified ${myShares.length === 1 ? 'provider or institution' : 'providers and institutions'}.`}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => setActiveTab('sharing')}
+                        className="px-4 py-2 text-xs font-semibold bg-slate-900 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded-lg transition"
+                      >
+                        Manage Sharing
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -2183,6 +3358,26 @@
                           Open Vault
                         </button>
                       </div>
+                    </div>
+
+                    {/* Shared patient profiles summary */}
+                    <div className="bg-slate-800/40 border border-slate-800 rounded-xl p-6 flex items-center justify-between flex-wrap gap-4">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-200 mb-1">Shared Health Profiles</h3>
+                        <p className="text-xs text-slate-400">
+                          {!sharedWithMeLoaded
+                            ? 'Health profiles patients have chosen to share with you appear here.'
+                            : sharedWithMe.length === 0
+                              ? 'No patients have shared their health profile with you yet.'
+                              : `${sharedWithMe.length} ${sharedWithMe.length === 1 ? 'patient has' : 'patients have'} shared their health profile with you.`}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => setActiveTab('sharing')}
+                        className="px-4 py-2 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition"
+                      >
+                        View Shared Profiles
+                      </button>
                     </div>
                   </div>
                 )}
@@ -2647,6 +3842,10 @@
                   </div>
                 )}
 
+                {/* TAB 5: HEALTH PROFILE SHARING */}
+                {activeTab === 'sharing' && accountType === 'patient' && renderPatientSharingTab()}
+                {activeTab === 'sharing' && accountType !== 'patient' && renderSharedProfilesTab()}
+
               </div>
               )
             ) : (
@@ -2762,11 +3961,44 @@
                   >
                     Message {selectedProfile.display_name || 'User'}
                   </button>
+
+                  {/* Patients can share their health profile with verified providers / institutions */}
+                  {user && canUseApp && accountType === 'patient' && isVerifiedShareRecipient(selectedProfile) && (
+                    findActiveShare(selectedProfile.id) ? (
+                      <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-emerald-800/60 bg-emerald-950/30 px-3 py-2.5">
+                        <p className="text-[11px] font-semibold text-emerald-300">✓ Your health profile is shared</p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedProfile(null);
+                            setActiveTab('sharing');
+                          }}
+                          className="text-[11px] font-semibold text-slate-300 hover:text-white underline underline-offset-2"
+                        >
+                          Manage
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => openShareConfirmation(selectedProfile)}
+                        className="mt-3 w-full px-4 py-2.5 rounded-lg border border-cyan-700/60 bg-slate-900 hover:bg-slate-700 text-cyan-300 text-xs font-semibold transition"
+                      >
+                        Share My Health Profile
+                      </button>
+                    )
+                  )}
                 </div>
 
               </div>
             </div>
           )}
+
+          {/* SHARE CONFIRMATION MODAL (patient) */}
+          {user && shareTarget && renderShareConfirmModal()}
+
+          {/* SHARED HEALTH PROFILE VIEW (verified provider / institution) */}
+          {user && viewingSharedProfile && renderSharedProfileModal()}
 
           {/* AUTH MODAL */}
           {showAuthModal && (
