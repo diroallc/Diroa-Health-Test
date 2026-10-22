@@ -31,6 +31,9 @@
     const SUPABASE_URL = 'https://ikzrbztopdmxhneloyim.supabase.co';
     const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlrenJienRvcGRteGhuZWxveWltIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTAzNzM0MDUsImV4cCI6MjEwNTk0OTQwNX0.yOtplAIElZrbdx-M-Cs12vE5Av6p8uBxiYY3IkHMCwA';
     const STORAGE_BUCKET = 'medical-vault';
+    const PROFILE_PHOTO_BUCKET = 'profile-photos';
+    const MAX_PROFILE_PHOTO_SIZE = 5 * 1024 * 1024; // 5 MB
+    const ALLOWED_PROFILE_PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 
     const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -290,6 +293,18 @@
       }
 
       return true;
+    }
+
+    // Each user has one stable avatar object. The bucket is public so profile
+    // photos can appear in search results, messages, and shared-profile views.
+    // Upload and delete permissions are restricted to that user's own folder.
+    function getProfilePhotoPublicUrl(userId, cacheKey = 'profile') {
+      if (!userId) return '';
+      const { data } = supabase.storage
+        .from(PROFILE_PHOTO_BUCKET)
+        .getPublicUrl(`${userId}/avatar`);
+      if (!data?.publicUrl) return '';
+      return `${data.publicUrl}?v=${encodeURIComponent(cacheKey || 'profile')}`;
     }
 
 
@@ -765,6 +780,15 @@
       const [emergencyContact, setEmergencyContact] = React.useState('');
       const [saving, setSaving] = React.useState(false);
 
+      // Profile-picture state (stored separately from the private medical vault).
+      const [profilePhotoVersion, setProfilePhotoVersion] = React.useState('');
+      const [profilePhotoExists, setProfilePhotoExists] = React.useState(false);
+      const [profilePhotoUploading, setProfilePhotoUploading] = React.useState(false);
+      const [profilePhotoRemoving, setProfilePhotoRemoving] = React.useState(false);
+      const [profilePhotoError, setProfilePhotoError] = React.useState('');
+      const [profilePhotoNotice, setProfilePhotoNotice] = React.useState('');
+      const profilePhotoInputRef = React.useRef(null);
+
       // Current medical condition / diagnosis, edited directly from the Dashboard
       const [medicalCondition, setMedicalCondition] = React.useState('');
       const [savingCondition, setSavingCondition] = React.useState(false);
@@ -890,6 +914,41 @@
         return () => subscription.unsubscribe();
       }, []);
 
+
+      // =========================================================================
+      // 6b. CHECK THE SIGNED-IN USER'S PROFILE PHOTO
+      // =========================================================================
+
+      React.useEffect(() => {
+        let cancelled = false;
+
+        async function checkProfilePhoto() {
+          if (!user?.id) {
+            setProfilePhotoExists(false);
+            setProfilePhotoVersion('');
+            setProfilePhotoError('');
+            setProfilePhotoNotice('');
+            return;
+          }
+
+          const { data, error } = await supabase.storage
+            .from(PROFILE_PHOTO_BUCKET)
+            .list(user.id, { limit: 20 });
+
+          if (cancelled) return;
+          if (error) {
+            // The app still loads if the bucket has not been configured yet;
+            // uploading will show the actionable Supabase error to the user.
+            console.warn('Could not check profile photo:', error.message);
+            return;
+          }
+
+          setProfilePhotoExists((data || []).some((file) => file.name === 'avatar'));
+        }
+
+        checkProfilePhoto();
+        return () => { cancelled = true; };
+      }, [user?.id]);
 
       // =========================================================================
       // 7. SEARCH DROPDOWN: CLOSE WHEN CLICKING OUTSIDE
@@ -1791,6 +1850,86 @@
 
 
       // =========================================================================
+      // 15z. PROFILE PHOTO UPLOAD / REMOVE
+      // =========================================================================
+
+      async function handleProfilePhotoChange(event) {
+        const input = event.target;
+        const file = input.files?.[0];
+        // Allow selecting the same file again after a previous upload.
+        input.value = '';
+        if (!file || !user) return;
+
+        if (!ALLOWED_PROFILE_PHOTO_TYPES.includes(file.type)) {
+          setProfilePhotoError('Choose a JPG, PNG, or WebP image.');
+          setProfilePhotoNotice('');
+          return;
+        }
+
+        if (file.size > MAX_PROFILE_PHOTO_SIZE) {
+          setProfilePhotoError('Profile pictures must be 5 MB or smaller.');
+          setProfilePhotoNotice('');
+          return;
+        }
+
+        setProfilePhotoUploading(true);
+        setProfilePhotoError('');
+        setProfilePhotoNotice('');
+
+        try {
+          const { error } = await supabase.storage
+            .from(PROFILE_PHOTO_BUCKET)
+            .upload(`${user.id}/avatar`, file, {
+              cacheControl: '0',
+              contentType: file.type,
+              upsert: true
+            });
+
+          if (error) throw error;
+
+          setProfilePhotoExists(true);
+          setProfilePhotoVersion(String(Date.now()));
+          setProfilePhotoNotice('Profile picture updated successfully.');
+        } catch (error) {
+          console.error('Profile photo upload error:', error);
+          const message = error?.message || 'Unknown error';
+          setProfilePhotoError(
+            message.toLowerCase().includes('bucket not found')
+              ? 'The profile-photos bucket is not configured yet. Run the supplied profile-photo-storage.sql in Supabase, then try again.'
+              : `Could not upload your profile picture: ${message}`
+          );
+        } finally {
+          setProfilePhotoUploading(false);
+        }
+      }
+
+      async function handleRemoveProfilePhoto() {
+        if (!user || profilePhotoRemoving || profilePhotoUploading) return;
+        if (!window.confirm('Remove your current profile picture?')) return;
+
+        setProfilePhotoRemoving(true);
+        setProfilePhotoError('');
+        setProfilePhotoNotice('');
+
+        try {
+          const { error } = await supabase.storage
+            .from(PROFILE_PHOTO_BUCKET)
+            .remove([`${user.id}/avatar`]);
+
+          if (error) throw error;
+
+          setProfilePhotoExists(false);
+          setProfilePhotoVersion(String(Date.now()));
+          setProfilePhotoNotice('Profile picture removed.');
+        } catch (error) {
+          console.error('Profile photo removal error:', error);
+          setProfilePhotoError(`Could not remove your profile picture: ${error?.message || 'Unknown error'}`);
+        } finally {
+          setProfilePhotoRemoving(false);
+        }
+      }
+
+      // =========================================================================
       // 16. SAVE PROFILE
       // =========================================================================
 
@@ -2304,10 +2443,74 @@
       // 16d. HEALTH PROFILE SHARING UI
       // =========================================================================
 
-      function renderInitialAvatar(name, sizeClass = 'w-9 h-9 text-xs') {
+      function renderInitialAvatar(name, sizeClass = 'w-9 h-9 text-xs', profileId = null, photoVersion = '') {
+        const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
+        const isCurrentUser = Boolean(profileId && user?.id === profileId);
+        const cacheKey = isCurrentUser ? (photoVersion || profilePhotoVersion || 'own') : 'profile';
+        const photoUrl = profileId ? getProfilePhotoPublicUrl(profileId, cacheKey) : '';
+
         return (
-          <div className={`${sizeClass} rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center shrink-0 font-bold text-cyan-400`}>
-            {(name || '?').trim().charAt(0).toUpperCase() || '?'}
+          <div className={`${sizeClass} relative overflow-hidden rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center shrink-0 font-bold text-cyan-400`}>
+            <span aria-hidden="true">{initial}</span>
+            {photoUrl && (
+              <img
+                key={`${profileId}-${cacheKey}`}
+                src={photoUrl}
+                alt=""
+                loading="lazy"
+                className="absolute inset-0 z-10 w-full h-full object-cover"
+                onError={(event) => { event.currentTarget.style.display = 'none'; }}
+              />
+            )}
+          </div>
+        );
+      }
+
+      function renderProfilePhotoEditor() {
+        const photoName = accountType === 'institution'
+          ? (credentials.institutionName || fullName || user?.email || 'Profile')
+          : (fullName || user?.email || 'Profile');
+        const busy = profilePhotoUploading || profilePhotoRemoving;
+
+        return (
+          <div className="mb-6 rounded-xl border border-slate-700 bg-slate-900/50 p-4 sm:p-5">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-4 sm:gap-5">
+              {renderInitialAvatar(photoName, 'w-20 h-20 text-2xl', user?.id, profilePhotoVersion)}
+              <div className="min-w-0 flex-1">
+                <h3 className="text-sm font-bold text-white">Profile Picture</h3>
+                <p className="text-xs text-slate-400 mt-1 leading-relaxed">Add a photo that other Diroa users can recognize. JPG, PNG, or WebP · Maximum 5 MB.</p>
+                {profilePhotoNotice && <p role="status" className="text-xs text-emerald-300 mt-2">{profilePhotoNotice}</p>}
+                {profilePhotoError && <p role="alert" className="text-xs text-red-300 mt-2 break-words">{profilePhotoError}</p>}
+              </div>
+              <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+                <input
+                  ref={profilePhotoInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  onChange={handleProfilePhotoChange}
+                  className="hidden"
+                  aria-label="Choose a profile picture"
+                />
+                <button
+                  type="button"
+                  onClick={() => profilePhotoInputRef.current?.click()}
+                  disabled={busy}
+                  className="px-3.5 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {profilePhotoUploading ? 'Uploading...' : profilePhotoExists ? 'Change Photo' : 'Upload Photo'}
+                </button>
+                {profilePhotoExists && (
+                  <button
+                    type="button"
+                    onClick={handleRemoveProfilePhoto}
+                    disabled={busy}
+                    className="px-3.5 py-2 rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {profilePhotoRemoving ? 'Removing...' : 'Remove'}
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
         );
       }
@@ -2407,7 +2610,7 @@
 
                     return (
                       <div key={profile.id} className="flex items-center gap-3 px-4 py-3 border-b border-slate-800 last:border-b-0">
-                        {renderInitialAvatar(profile.display_name)}
+                        {renderInitialAvatar(profile.display_name, 'w-9 h-9 text-xs', profile.id)}
                         <div className="min-w-0 flex-1">
                           <p className="text-sm font-semibold text-white truncate">{profile.display_name || 'Unnamed Account'}</p>
                           <p className="text-[10px] text-slate-400 mt-0.5 truncate">
@@ -2476,7 +2679,7 @@
 
                     return (
                       <div key={share.recipient_id} className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex items-center gap-4 flex-wrap sm:flex-nowrap">
-                        {renderInitialAvatar(name, 'w-10 h-10 text-sm')}
+                        {renderInitialAvatar(name, 'w-10 h-10 text-sm', profile?.id || share.recipient_id)}
                         <div className="min-w-0 flex-1">
                           <p className="text-xs font-semibold text-slate-200 truncate">{name}</p>
                           <p className="text-[10px] text-slate-500 mt-1">
@@ -2541,7 +2744,7 @@
               <p className="text-xs text-slate-400 leading-relaxed">Review exactly what will be shared before you confirm.</p>
 
               <div className="mt-5 flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-900/60 p-4">
-                {renderInitialAvatar(name, 'w-10 h-10 text-sm')}
+                {renderInitialAvatar(name, 'w-10 h-10 text-sm', target.id)}
                 <div className="min-w-0">
                   <p className="text-sm font-semibold text-white truncate">{name}</p>
                   <p className="text-[10px] text-slate-400 mt-0.5">
@@ -2695,7 +2898,7 @@
 
                     return (
                       <div key={entry.patient_id} className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex items-center gap-4 flex-wrap sm:flex-nowrap">
-                        {renderInitialAvatar(name, 'w-10 h-10 text-sm')}
+                        {renderInitialAvatar(name, 'w-10 h-10 text-sm', entry.patient_id)}
                         <div className="min-w-0 flex-1">
                           <p className="text-xs font-semibold text-slate-200 truncate">{name}</p>
                           <p className="text-[10px] text-slate-500 mt-1">Shared with you on {formatShareDate(entry.shared_at)}</p>
@@ -2755,7 +2958,7 @@
               </span>
 
               <div className="flex items-center gap-3">
-                {renderInitialAvatar(name, 'w-11 h-11 text-sm')}
+                {renderInitialAvatar(name, 'w-11 h-11 text-sm', entry.patient_id || profile.id)}
                 <div className="min-w-0">
                   <h3 id="shared-profile-title" className="text-lg font-bold text-white truncate pr-6">{name}</h3>
                   <p className="text-[10px] text-slate-400 mt-0.5">
@@ -3079,19 +3282,21 @@
                                 className="w-full text-left px-4 py-3 hover:bg-slate-800/80 border-b border-slate-800 last:border-b-0 transition"
                               >
                                 <div className="flex items-center justify-between gap-3">
-                                  <div className="min-w-0">
-                                    <p className="text-sm font-semibold text-white truncate">
-                                      {profile.display_name || 'Unnamed User'}
-                                    </p>
-                                    <p className="text-[10px] text-slate-400 mt-1">
-                                      {profile.account_type === 'provider'
-                                        ? 'Healthcare Provider'
-                                        : profile.account_type === 'institution'
-                                          ? 'Institution'
-                                          : 'Patient'}
-                                    </p>
+                                  <div className="flex items-center gap-3 min-w-0">
+                                    {renderInitialAvatar(profile.display_name, 'w-10 h-10 text-sm', profile.id)}
+                                    <div className="min-w-0">
+                                      <p className="text-sm font-semibold text-white truncate">
+                                        {profile.display_name || 'Unnamed User'}
+                                      </p>
+                                      <p className="text-[10px] text-slate-400 mt-1">
+                                        {profile.account_type === 'provider'
+                                          ? 'Healthcare Provider'
+                                          : profile.account_type === 'institution'
+                                            ? 'Institution'
+                                            : 'Patient'}
+                                      </p>
+                                    </div>
                                   </div>
-
                                   {profile.verification_status === 'verified' && (
                                     <span className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-400">
                                       <span>✓</span> Verified
@@ -3389,6 +3594,7 @@
                       {accountType === 'provider' ? 'Professional Profile' : 'Institution Profile'}
                     </h2>
                     <p className="text-xs text-slate-400 mb-6">Keep your details up to date. Submitting saves directly to your database.</p>
+                    {renderProfilePhotoEditor()}
                     {renderProfessionalForm('Save Profile to Database')}
                   </div>
                 )}
@@ -3398,6 +3604,8 @@
                   <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
                     <h2 className="text-xl font-bold text-white mb-1">Personal Health Profile Template</h2>
                     <p className="text-xs text-slate-400 mb-6">Fill in your health records below. Submitting saves directly to your database.</p>
+
+                    {renderProfilePhotoEditor()}
 
                     <form onSubmit={handleSaveProfile} className="space-y-5">
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -3576,7 +3784,7 @@
                                 className="w-full text-left pl-4 pr-11 py-3.5"
                               >
                                 <div className="flex items-start gap-3">
-                                  <div className="w-9 h-9 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center shrink-0 text-xs font-bold text-cyan-400">{(conversation.profile?.display_name || '?').trim().charAt(0).toUpperCase()}</div>
+                                  {renderInitialAvatar(conversation.profile?.display_name, 'w-9 h-9 text-xs', conversation.profile?.id || conversation.userId)}
                                   <div className="min-w-0 flex-1">
                                     <div className="flex items-center justify-between gap-2">
                                       <p className="text-xs font-semibold text-slate-100 truncate">{conversation.profile?.display_name || 'Unknown User'}</p>
@@ -3617,7 +3825,7 @@
                         {activeConversationProfile ? (
                           <>
                             <div className="px-5 py-4 border-b border-slate-700 bg-slate-900/70 flex items-center gap-3">
-                              <div className="w-10 h-10 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-sm font-bold text-cyan-400">{(activeConversationProfile.display_name || '?').trim().charAt(0).toUpperCase()}</div>
+                              {renderInitialAvatar(activeConversationProfile.display_name, 'w-10 h-10 text-sm', activeConversationProfile.id || activeConversationId)}
                               <div className="min-w-0 flex-1">
                                 <p className="text-sm font-bold text-white truncate">{activeConversationProfile.display_name || 'Unknown User'}</p>
                                 <p className="text-[10px] text-slate-500 mt-0.5">
@@ -3887,17 +4095,21 @@
                   Profile
                 </h3>
 
-                <p className="text-xl font-bold text-white mt-4">
-                  {selectedProfile.display_name || 'Unnamed User'}
-                </p>
-
-                <p className="text-xs text-slate-400 mt-1">
-                  {selectedProfile.account_type === 'provider'
-                    ? 'Healthcare Provider'
-                    : selectedProfile.account_type === 'institution'
-                      ? 'Institution'
-                      : 'Patient'}
-                </p>
+                <div className="mt-4 flex items-center gap-4">
+                  {renderInitialAvatar(selectedProfile.display_name, 'w-16 h-16 text-xl', selectedProfile.id)}
+                  <div className="min-w-0">
+                    <p className="text-xl font-bold text-white break-words">
+                      {selectedProfile.display_name || 'Unnamed User'}
+                    </p>
+                    <p className="text-xs text-slate-400 mt-1">
+                      {selectedProfile.account_type === 'provider'
+                        ? 'Healthcare Provider'
+                        : selectedProfile.account_type === 'institution'
+                          ? 'Institution'
+                          : 'Patient'}
+                    </p>
+                  </div>
+                </div>
 
                 {selectedProfile.verification_status === 'verified' && (
                   <p className="text-xs text-emerald-400 font-semibold mt-3">
