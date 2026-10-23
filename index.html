@@ -819,6 +819,16 @@
       const [deletingFile, setDeletingFile] = React.useState(null);
       const fileInputRef = React.useRef(null);
 
+      // Private notes saved to the verified provider / institution's own vault.
+      // These notes are not included in patient profile shares.
+      const [vaultNotes, setVaultNotes] = React.useState([]);
+      const [vaultNotesLoading, setVaultNotesLoading] = React.useState(false);
+      const [newVaultNote, setNewVaultNote] = React.useState('');
+      const [savingVaultNote, setSavingVaultNote] = React.useState(false);
+      const [deletingVaultNote, setDeletingVaultNote] = React.useState(null);
+      const [vaultNotesError, setVaultNotesError] = React.useState('');
+      const [vaultNotesMessage, setVaultNotesMessage] = React.useState('');
+
       // -----------------------------------------------------------------------
       // HEALTH PROFILE SHARING STATE
       // -----------------------------------------------------------------------
@@ -979,8 +989,16 @@
       React.useEffect(() => {
         if (user && canUseApp && activeTab === 'vault') {
           loadVaultFiles(user.id);
+
+          if ((accountType === 'provider' || accountType === 'institution') && verificationStatus === 'verified') {
+            loadVaultNotes(user.id);
+          } else {
+            setVaultNotes([]);
+            setVaultNotesError('');
+            setVaultNotesMessage('');
+          }
         }
-      }, [activeTab, user, canUseApp]);
+      }, [activeTab, user, canUseApp, accountType, verificationStatus]);
 
 
       // =========================================================================
@@ -1623,12 +1641,124 @@
 
 
       // =========================================================================
+      // 10b. PROVIDER VAULT NOTES
+      // =========================================================================
+
+      async function loadVaultNotes(userId) {
+        if (!userId || !['provider', 'institution'].includes(accountType) || verificationStatus !== 'verified') {
+          setVaultNotes([]);
+          return;
+        }
+
+        setVaultNotesLoading(true);
+        setVaultNotesError('');
+
+        try {
+          const { data, error } = await supabase
+            .from('provider_vault_notes')
+            .select('id, user_id, note_text, created_at, updated_at')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false });
+
+          if (error) throw error;
+          setVaultNotes(data || []);
+        } catch (error) {
+          console.error('Provider vault notes load error:', error);
+          if (['42P01', 'PGRST205', '42501'].includes(error?.code) || /provider_vault_notes|permission denied|row-level security/i.test(error?.message || '')) {
+            setVaultNotesError('Provider notes are not set up yet, or their database permissions are missing. Run provider-vault-access-and-notes.sql in the Supabase SQL Editor, then reload this page.');
+          } else {
+            setVaultNotesError(error?.message || 'Could not load your notes.');
+          }
+          setVaultNotes([]);
+        } finally {
+          setVaultNotesLoading(false);
+        }
+      }
+
+      async function handleSaveVaultNote(event) {
+        event?.preventDefault?.();
+
+        if (!user || !['provider', 'institution'].includes(accountType) || verificationStatus !== 'verified') {
+          setVaultNotesError('Only verified providers and institutions can manage provider vault notes.');
+          return;
+        }
+
+        const noteText = newVaultNote.trim();
+        if (!noteText) {
+          setVaultNotesError('Enter a note before saving.');
+          return;
+        }
+        if (noteText.length > 10000) {
+          setVaultNotesError('Notes must be 10,000 characters or fewer.');
+          return;
+        }
+
+        setSavingVaultNote(true);
+        setVaultNotesError('');
+        setVaultNotesMessage('');
+
+        try {
+          const { data, error } = await supabase
+            .from('provider_vault_notes')
+            .insert({ user_id: user.id, note_text: noteText })
+            .select('id, user_id, note_text, created_at, updated_at')
+            .single();
+
+          if (error) throw error;
+          setVaultNotes((previous) => [data, ...previous]);
+          setNewVaultNote('');
+          setVaultNotesMessage('Note saved to your private vault.');
+        } catch (error) {
+          console.error('Provider vault note save error:', error);
+          if (['42P01', 'PGRST205', '42501'].includes(error?.code) || /provider_vault_notes|permission denied|row-level security/i.test(error?.message || '')) {
+            setVaultNotesError('Could not save the note. Run provider-vault-access-and-notes.sql in the Supabase SQL Editor, then reload this page.');
+          } else {
+            setVaultNotesError(error?.message || 'Could not save your note.');
+          }
+        } finally {
+          setSavingVaultNote(false);
+        }
+      }
+
+      async function handleDeleteVaultNote(note) {
+        if (!user || !note?.id || !['provider', 'institution'].includes(accountType) || verificationStatus !== 'verified') return;
+        if (!window.confirm('Delete this note permanently?')) return;
+
+        setDeletingVaultNote(note.id);
+        setVaultNotesError('');
+        setVaultNotesMessage('');
+
+        try {
+          const { error } = await supabase
+            .from('provider_vault_notes')
+            .delete()
+            .eq('id', note.id)
+            .eq('user_id', user.id);
+
+          if (error) throw error;
+          setVaultNotes((previous) => previous.filter((item) => item.id !== note.id));
+          setVaultNotesMessage('Note deleted.');
+        } catch (error) {
+          console.error('Provider vault note delete error:', error);
+          setVaultNotesError(error?.message || 'Could not delete this note.');
+        } finally {
+          setDeletingVaultNote(null);
+        }
+      }
+
+
+      // =========================================================================
       // 11. UPLOAD FILE
       // =========================================================================
 
       async function handleVaultUpload(file) {
         if (!user) {
           setUploadError('You must be signed in to upload files.');
+          return;
+        }
+
+        if (requiresVerification(accountType) && verificationStatus !== 'verified') {
+          setUploadError('Your provider or institution account must be verified before uploading documents.');
           return;
         }
 
@@ -3982,6 +4112,80 @@
                         )}
                       </div>
                     </div>
+
+                    {(accountType === 'provider' || accountType === 'institution') && verificationStatus === 'verified' && (
+                      <section className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
+                        <div className="mb-4">
+                          <h3 className="text-sm font-bold text-white">Private Provider Notes</h3>
+                          <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">Save follow-up reminders or private work notes in your own vault. These notes are not visible to patients through profile sharing.</p>
+                        </div>
+
+                        <form onSubmit={handleSaveVaultNote} className="space-y-3">
+                          <textarea
+                            value={newVaultNote}
+                            onChange={(event) => setNewVaultNote(event.target.value)}
+                            maxLength={10000}
+                            rows={4}
+                            placeholder="Write a private note..."
+                            className="w-full resize-y rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-100 placeholder-slate-500 outline-none focus:border-cyan-500"
+                          />
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <p className="text-[10px] text-slate-500">{newVaultNote.length.toLocaleString()} / 10,000 characters</p>
+                            <button
+                              type="submit"
+                              disabled={savingVaultNote || !newVaultNote.trim()}
+                              className="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-[11px] font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              {savingVaultNote ? 'Saving...' : 'Save Note'}
+                            </button>
+                          </div>
+                        </form>
+
+                        {vaultNotesMessage && <p className="mt-3 text-[11px] text-cyan-400">{vaultNotesMessage}</p>}
+                        {vaultNotesError && <p className="mt-3 text-[11px] text-red-300 leading-relaxed">{vaultNotesError}</p>}
+
+                        <div className="mt-5 border-t border-slate-700/80 pt-4">
+                          <div className="flex items-center justify-between gap-3 mb-3">
+                            <h4 className="text-xs font-semibold text-slate-200">Saved Notes</h4>
+                            <button
+                              type="button"
+                              onClick={() => user && loadVaultNotes(user.id)}
+                              disabled={vaultNotesLoading}
+                              className="px-3 py-1.5 text-[10px] font-semibold bg-slate-900 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-300 disabled:opacity-50"
+                            >
+                              {vaultNotesLoading ? 'Refreshing...' : 'Refresh Notes'}
+                            </button>
+                          </div>
+
+                          {vaultNotesLoading ? (
+                            <p className="py-5 text-center text-xs text-slate-500">Loading notes...</p>
+                          ) : vaultNotes.length === 0 ? (
+                            <div className="rounded-xl border border-slate-800 bg-slate-900/30 px-4 py-6 text-center">
+                              <p className="text-xs text-slate-400">No notes saved yet.</p>
+                            </div>
+                          ) : (
+                            <div className="space-y-3">
+                              {vaultNotes.map((note) => (
+                                <article key={note.id} className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+                                  <div className="flex items-start justify-between gap-3">
+                                    <p className="text-[10px] text-slate-500">{note.created_at ? new Date(note.created_at).toLocaleString() : 'Saved note'}</p>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteVaultNote(note)}
+                                      disabled={deletingVaultNote === note.id}
+                                      className="shrink-0 text-[10px] font-semibold text-red-300 hover:text-red-200 disabled:opacity-50"
+                                    >
+                                      {deletingVaultNote === note.id ? 'Deleting...' : 'Delete'}
+                                    </button>
+                                  </div>
+                                  <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-relaxed text-slate-200">{note.note_text}</p>
+                                </article>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </section>
+                    )}
 
                     <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
                       <div className="flex items-center justify-between mb-5">
