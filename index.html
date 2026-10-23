@@ -864,6 +864,26 @@
       const [sharedVaultLoading, setSharedVaultLoading] = React.useState(false);
       const [sharedVaultError, setSharedVaultError] = React.useState('');
       const [openingSharedFile, setOpeningSharedFile] = React.useState(null);
+      const [sharedVaultWriteAllowed, setSharedVaultWriteAllowed] = React.useState(false);
+      const [sharedVaultWriteLoading, setSharedVaultWriteLoading] = React.useState(false);
+      const [sharedVaultWriteError, setSharedVaultWriteError] = React.useState('');
+      const [sharedVaultUploading, setSharedVaultUploading] = React.useState(false);
+      const [sharedVaultUploadMessage, setSharedVaultUploadMessage] = React.useState('');
+      const [sharedVaultUploadError, setSharedVaultUploadError] = React.useState('');
+      const sharedVaultUploadInputRef = React.useRef(null);
+
+      // Notes are attached to a shared patient profile and private to the provider who wrote them.
+      const [sharedPatientNotes, setSharedPatientNotes] = React.useState([]);
+      const [sharedPatientNotesLoading, setSharedPatientNotesLoading] = React.useState(false);
+      const [sharedPatientNoteDraft, setSharedPatientNoteDraft] = React.useState('');
+      const [savingSharedPatientNote, setSavingSharedPatientNote] = React.useState(false);
+      const [deletingSharedPatientNoteId, setDeletingSharedPatientNoteId] = React.useState(null);
+      const [sharedPatientNotesError, setSharedPatientNotesError] = React.useState('');
+      const [sharedPatientNotesMessage, setSharedPatientNotesMessage] = React.useState('');
+
+      // Patient-managed consent controls which providers may add files / notes to a shared profile.
+      const [providerWriteConsents, setProviderWriteConsents] = React.useState([]);
+      const [writeConsentBusyId, setWriteConsentBusyId] = React.useState(null);
 
       const sharingTabLabel = accountType === 'patient' ? 'Sharing' : 'Shared Profiles';
 
@@ -918,6 +938,16 @@
             setShareVaultPreviewError('');
             setSharedVaultFiles([]);
             setSharedVaultError('');
+            setSharedVaultWriteAllowed(false);
+            setSharedVaultWriteError('');
+            setSharedVaultUploadMessage('');
+            setSharedVaultUploadError('');
+            setSharedPatientNotes([]);
+            setSharedPatientNoteDraft('');
+            setSharedPatientNotesError('');
+            setSharedPatientNotesMessage('');
+            setProviderWriteConsents([]);
+            setWriteConsentBusyId(null);
           }
         });
 
@@ -1198,6 +1228,20 @@
           setMyShares(rows);
           setMySharesLoaded(true);
           setShareError('');
+
+          const { data: consentRows, error: consentError } = await supabase
+            .from('provider_vault_write_consents')
+            .select('provider_id, granted_at')
+            .eq('patient_id', user.id);
+
+          if (requestId !== mySharesRequestRef.current) return;
+          if (consentError) {
+            console.error('Provider contribution consent load error:', consentError.message);
+            setProviderWriteConsents([]);
+            setShareError('Provider contribution settings are not configured yet. Run the updated shared-profile access SQL, then refresh.');
+          } else {
+            setProviderWriteConsents(consentRows || []);
+          }
         } catch (error) {
           if (requestId !== mySharesRequestRef.current) return;
           setShareError(describeSharingError(error, 'Could not load who you are sharing with.'));
@@ -1340,6 +1384,80 @@
         return () => { cancelled = true; };
       }, [viewingSharedProfile?.patient_id, user?.id]);
 
+      // Load consent status and this provider's private notes for the open shared patient.
+      React.useEffect(() => {
+        const patientId = viewingSharedProfile?.patient_id;
+        if (!user || !patientId || !['provider', 'institution'].includes(accountType) || verificationStatus !== 'verified') {
+          setSharedVaultWriteAllowed(false);
+          setSharedVaultWriteError('');
+          setSharedPatientNotes([]);
+          setSharedPatientNoteDraft('');
+          setSharedPatientNotesError('');
+          setSharedPatientNotesMessage('');
+          setSharedVaultWriteLoading(false);
+          setSharedPatientNotesLoading(false);
+          return;
+        }
+
+        let cancelled = false;
+        setSharedVaultWriteLoading(true);
+        setSharedVaultWriteError('');
+        setSharedVaultUploadError('');
+        setSharedVaultUploadMessage('');
+        setSharedPatientNotesLoading(true);
+        setSharedPatientNotesError('');
+        setSharedPatientNotesMessage('');
+        setSharedPatientNoteDraft('');
+
+        (async () => {
+          const { data: consent, error: consentError } = await supabase
+            .from('provider_vault_write_consents')
+            .select('provider_id')
+            .eq('patient_id', patientId)
+            .eq('provider_id', user.id)
+            .maybeSingle();
+
+          if (!cancelled) {
+            if (consentError) {
+              console.error('Shared profile consent check error:', consentError.message);
+              setSharedVaultWriteAllowed(false);
+              setSharedVaultWriteError('Contribution permissions are not set up yet. Run the updated shared-profile access SQL in Supabase, then reload this page.');
+            } else {
+              setSharedVaultWriteAllowed(Boolean(consent));
+              setSharedVaultWriteError('');
+            }
+            setSharedVaultWriteLoading(false);
+          }
+
+          const { data: notes, error: notesError } = await supabase
+            .from('provider_patient_notes')
+            .select('id, patient_id, provider_id, note_text, created_at')
+            .eq('patient_id', patientId)
+            .eq('provider_id', user.id)
+            .order('created_at', { ascending: false });
+
+          if (cancelled) return;
+          if (notesError) {
+            console.error('Shared patient notes load error:', notesError.message);
+            setSharedPatientNotes([]);
+            setSharedPatientNotesError('Patient-linked notes are not set up yet. Run the updated shared-profile access SQL in Supabase, then reload.');
+          } else {
+            setSharedPatientNotes(notes || []);
+            setSharedPatientNotesError('');
+          }
+          setSharedPatientNotesLoading(false);
+        })().catch((error) => {
+          if (cancelled) return;
+          console.error('Shared profile contribution load error:', error);
+          setSharedVaultWriteAllowed(false);
+          setSharedVaultWriteLoading(false);
+          setSharedPatientNotesLoading(false);
+          setSharedPatientNotesError(error?.message || 'Could not load provider notes.');
+        });
+
+        return () => { cancelled = true; };
+      }, [viewingSharedProfile?.patient_id, user?.id, accountType, verificationStatus]);
+
 
       // =========================================================================
       // 9c. HEALTH PROFILE SHARING: ACTIONS
@@ -1376,8 +1494,32 @@
         setShareConfirmError('');
 
         try {
-          await shareHealthProfile(target.id);
+          // Consent is stored separately because existing shares were originally read-only.
+          // A new share is not considered complete unless the patient's contribution consent is saved.
+          const { error: staleConsentError } = await supabase
+            .from('provider_vault_write_consents')
+            .delete()
+            .eq('patient_id', user.id)
+            .eq('provider_id', target.id);
+          if (staleConsentError) throw staleConsentError;
 
+          const { error: consentError } = await supabase
+            .from('provider_vault_write_consents')
+            .insert({ patient_id: user.id, provider_id: target.id });
+          if (consentError) throw consentError;
+
+          try {
+            await shareHealthProfile(target.id);
+          } catch (shareError) {
+            await supabase
+              .from('provider_vault_write_consents')
+              .delete()
+              .eq('patient_id', user.id)
+              .eq('provider_id', target.id);
+            throw shareError;
+          }
+
+          setProviderWriteConsents((previous) => [...previous.filter((item) => item.provider_id !== target.id), { provider_id: target.id, granted_at: new Date().toISOString() }]);
           setShareTarget(null);
           setShareConsent(false);
           setShareError('');
@@ -1390,6 +1532,60 @@
           setShareConfirmError(describeSharingError(error, 'Your health profile could not be shared.'));
         } finally {
           setSharingInProgress(false);
+        }
+      }
+
+      function hasProviderWriteConsent(providerId) {
+        return providerWriteConsents.some((consent) => consent.provider_id === providerId);
+      }
+
+      async function handleToggleProviderContributions(share) {
+        if (!user || accountType !== 'patient' || !share?.recipient_id || writeConsentBusyId) return;
+
+        const providerId = share.recipient_id;
+        const enabled = hasProviderWriteConsent(providerId);
+        const providerName = share.profile?.display_name || 'this provider / institution';
+        const prompt = enabled
+          ? `Disable new document uploads and provider notes for ${providerName}? Existing documents already added to your vault will remain there.`
+          : `Allow ${providerName} to add new documents to your Medical Vault and save private notes linked to your shared profile (only visible to that provider)? They still cannot edit your profile fields or change/delete your existing files.`;
+        if (!window.confirm(prompt)) return;
+
+        setWriteConsentBusyId(providerId);
+        setShareError('');
+        setShareNotice('');
+        try {
+          if (enabled) {
+            const { error } = await supabase
+              .from('provider_vault_write_consents')
+              .delete()
+              .eq('patient_id', user.id)
+              .eq('provider_id', providerId);
+            if (error) throw error;
+            setProviderWriteConsents((previous) => previous.filter((item) => item.provider_id !== providerId));
+            setShareNotice(`Provider uploads and notes are now disabled for ${providerName}.`);
+          } else {
+            // Remove any stale consent first so every re-enable is an explicit patient action.
+            const { error: removeError } = await supabase
+              .from('provider_vault_write_consents')
+              .delete()
+              .eq('patient_id', user.id)
+              .eq('provider_id', providerId);
+            if (removeError) throw removeError;
+
+            const { data, error } = await supabase
+              .from('provider_vault_write_consents')
+              .insert({ patient_id: user.id, provider_id: providerId })
+              .select('provider_id, granted_at')
+              .single();
+            if (error) throw error;
+            setProviderWriteConsents((previous) => [...previous.filter((item) => item.provider_id !== providerId), data]);
+            setShareNotice(`${providerName} can now add documents and private notes while you continue sharing your profile.`);
+          }
+        } catch (error) {
+          console.error('Provider contribution consent update error:', error);
+          setShareError(error?.message || 'Could not update provider contribution permissions.');
+        } finally {
+          setWriteConsentBusyId(null);
         }
       }
 
@@ -1407,7 +1603,16 @@
         setShareNotice('');
 
         try {
+          // Remove the write consent too, so a future share requires fresh explicit permission.
+          const { error: consentError } = await supabase
+            .from('provider_vault_write_consents')
+            .delete()
+            .eq('patient_id', user.id)
+            .eq('provider_id', share.recipient_id);
+          if (consentError) throw consentError;
+
           await revokeHealthProfileShare(share.recipient_id);
+          setProviderWriteConsents((previous) => previous.filter((item) => item.provider_id !== share.recipient_id));
           setMyShares((previous) => previous.filter((item) => item.recipient_id !== share.recipient_id));
           setShareNotice(`You stopped sharing your health profile and documents with ${name}.`);
           loadMyShares();
@@ -1639,6 +1844,125 @@
         }
       }
 
+
+      // Upload a new file directly into the patient's vault. RLS requires both an active share
+      // and explicit patient consent; the provider can never overwrite or delete existing patient files.
+      async function handleSharedVaultUpload(file) {
+        const patientId = viewingSharedProfile?.patient_id;
+        if (!user || !patientId) {
+          setSharedVaultUploadError('Open an active shared patient profile before uploading.');
+          return;
+        }
+        if (!['provider', 'institution'].includes(accountType) || verificationStatus !== 'verified') {
+          setSharedVaultUploadError('Only verified providers and institutions can contribute documents.');
+          return;
+        }
+        if (!sharedVaultWriteAllowed) {
+          setSharedVaultUploadError('The patient has not enabled provider uploads and notes for this share.');
+          return;
+        }
+        if (!file) return;
+
+        const allowedTypes = ['application/pdf', 'image/png', 'image/jpeg'];
+        if (!allowedTypes.includes(file.type)) {
+          setSharedVaultUploadError('Only PDF, PNG, and JPG files are allowed.');
+          setSharedVaultUploadMessage('');
+          if (sharedVaultUploadInputRef.current) sharedVaultUploadInputRef.current.value = '';
+          return;
+        }
+        if (file.size > 25 * 1024 * 1024) {
+          setSharedVaultUploadError('File is too large. Maximum size is 25MB.');
+          setSharedVaultUploadMessage('');
+          if (sharedVaultUploadInputRef.current) sharedVaultUploadInputRef.current.value = '';
+          return;
+        }
+
+        setSharedVaultUploading(true);
+        setSharedVaultUploadError('');
+        setSharedVaultUploadMessage('');
+        try {
+          const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+          const uniqueId = crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36);
+          const filePath = `${patientId}/${uniqueId}-${safeName}`;
+          const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(filePath, file, {
+            cacheControl: '3600',
+            upsert: false,
+            contentType: file.type
+          });
+          if (error) throw error;
+
+          const files = await fetchSharedVaultFiles(patientId);
+          setSharedVaultFiles(files);
+          setSharedVaultUploadMessage(`Added ${file.name} to ${viewingSharedProfile?.profile?.full_name || 'the patient'}'s Medical Vault.`);
+        } catch (error) {
+          console.error('Shared patient vault upload error:', error);
+          setSharedVaultUploadError(error?.message || 'Could not upload this document. Confirm the patient still shares their profile and has enabled contributions.');
+        } finally {
+          setSharedVaultUploading(false);
+          if (sharedVaultUploadInputRef.current) sharedVaultUploadInputRef.current.value = '';
+        }
+      }
+
+      async function handleSaveSharedPatientNote(event) {
+        event?.preventDefault?.();
+        const patientId = viewingSharedProfile?.patient_id;
+        if (!user || !patientId || !sharedVaultWriteAllowed || !['provider', 'institution'].includes(accountType) || verificationStatus !== 'verified') {
+          setSharedPatientNotesError('The patient has not enabled provider uploads and notes for this share.');
+          return;
+        }
+        const noteText = sharedPatientNoteDraft.trim();
+        if (!noteText) {
+          setSharedPatientNotesError('Enter a note before saving.');
+          return;
+        }
+        if (noteText.length > 10000) {
+          setSharedPatientNotesError('Notes must be 10,000 characters or fewer.');
+          return;
+        }
+
+        setSavingSharedPatientNote(true);
+        setSharedPatientNotesError('');
+        setSharedPatientNotesMessage('');
+        try {
+          const { data, error } = await supabase
+            .from('provider_patient_notes')
+            .insert({ patient_id: patientId, provider_id: user.id, note_text: noteText })
+            .select('id, patient_id, provider_id, note_text, created_at')
+            .single();
+          if (error) throw error;
+          setSharedPatientNotes((previous) => [data, ...previous]);
+          setSharedPatientNoteDraft('');
+          setSharedPatientNotesMessage('Private note saved to this shared patient profile.');
+        } catch (error) {
+          console.error('Save shared patient note error:', error);
+          setSharedPatientNotesError(error?.message || 'Could not save this note. Confirm the patient still shares their profile and has enabled contributions.');
+        } finally {
+          setSavingSharedPatientNote(false);
+        }
+      }
+
+      async function handleDeleteSharedPatientNote(note) {
+        if (!user || !note?.id || note.provider_id !== user.id) return;
+        if (!window.confirm('Delete this provider note permanently?')) return;
+        setDeletingSharedPatientNoteId(note.id);
+        setSharedPatientNotesError('');
+        setSharedPatientNotesMessage('');
+        try {
+          const { error } = await supabase
+            .from('provider_patient_notes')
+            .delete()
+            .eq('id', note.id)
+            .eq('provider_id', user.id);
+          if (error) throw error;
+          setSharedPatientNotes((previous) => previous.filter((item) => item.id !== note.id));
+          setSharedPatientNotesMessage('Note deleted.');
+        } catch (error) {
+          console.error('Delete shared patient note error:', error);
+          setSharedPatientNotesError(error?.message || 'Could not delete this note.');
+        } finally {
+          setDeletingSharedPatientNoteId(null);
+        }
+      }
 
       // =========================================================================
       // 10b. PROVIDER VAULT NOTES
@@ -2654,14 +2978,14 @@
             <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
               <h2 className="text-xl font-bold text-white mb-1">Share Your Health Profile</h2>
               <p className="text-xs text-slate-400 mb-4 leading-relaxed max-w-2xl">
-                Give a verified provider or institution read-only access to your health profile and Medical Vault documents. Nothing is shared until you review and confirm, and you can stop sharing at any time.
+                Share your health profile and Medical Vault with a verified provider or institution. You can allow that provider to add new vault documents and save private notes linked to your profile (those notes are visible only to that provider); they cannot edit your profile fields or change/delete your existing files. Nothing is shared until you review and confirm, and you can stop sharing at any time.
               </p>
 
               <div className="mb-5 grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div className="rounded-lg border border-slate-700 bg-slate-900/50 p-3">
                   <p className="text-[10px] font-semibold uppercase tracking-wider text-cyan-400 mb-1">Shared</p>
                   <p className="text-[11px] text-slate-300 leading-relaxed">
-                    {SHARED_PROFILE_FIELDS.map((field) => field.label).join(', ')}, and your Medical Vault documents (view and download only)
+                    {SHARED_PROFILE_FIELDS.map((field) => field.label).join(', ')}, and your Medical Vault documents. With your explicit permission, the provider can add new documents and private notes that only the provider can see; existing files remain protected.
                   </p>
                 </div>
                 <div className="rounded-lg border border-slate-700 bg-slate-900/50 p-3">
@@ -2774,7 +3098,7 @@
                 <div>
                   <h3 className="text-sm font-bold text-white">Who Can See Your Health Profile</h3>
                   <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
-                    Each of these sees your latest saved profile and your Medical Vault documents, read-only, until you stop sharing.
+                    Each can view your latest saved profile and existing Medical Vault documents. You separately control whether each provider can add new documents and private notes.
                   </p>
                 </div>
                 <button
@@ -2822,15 +3146,30 @@
                               No longer verified. They cannot open your profile unless they are verified again.
                             </p>
                           )}
+                          <p className="text-[10px] mt-1 leading-relaxed">
+                            <span className={hasProviderWriteConsent(share.recipient_id) ? 'text-emerald-300' : 'text-slate-500'}>
+                              {hasProviderWriteConsent(share.recipient_id) ? 'Provider uploads and private notes are enabled.' : 'Provider uploads and private notes are disabled.'}
+                            </span>
+                          </p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => handleStopSharing(share)}
-                          disabled={Boolean(revokingShareId)}
-                          className="shrink-0 px-3 py-1.5 text-[10px] font-semibold bg-slate-800 hover:bg-red-900/50 text-red-400 border border-slate-700 hover:border-red-800 rounded-lg transition disabled:opacity-50"
-                        >
-                          {revokingShareId === share.recipient_id ? 'Stopping...' : 'Stop Sharing'}
-                        </button>
+                        <div className="flex flex-wrap items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleToggleProviderContributions(share)}
+                            disabled={Boolean(revokingShareId) || writeConsentBusyId === share.recipient_id || !stillVerified}
+                            className={`px-3 py-1.5 text-[10px] font-semibold rounded-lg border transition disabled:opacity-50 ${hasProviderWriteConsent(share.recipient_id) ? 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700' : 'bg-cyan-600 hover:bg-cyan-500 text-white border-cyan-700'}`}
+                          >
+                            {writeConsentBusyId === share.recipient_id ? 'Saving...' : hasProviderWriteConsent(share.recipient_id) ? 'Disable Contributions' : 'Enable Uploads & Notes'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleStopSharing(share)}
+                            disabled={Boolean(revokingShareId)}
+                            className="shrink-0 px-3 py-1.5 text-[10px] font-semibold bg-slate-800 hover:bg-red-900/50 text-red-400 border border-slate-700 hover:border-red-800 rounded-lg transition disabled:opacity-50"
+                          >
+                            {revokingShareId === share.recipient_id ? 'Stopping...' : 'Stop Sharing'}
+                          </button>
+                        </div>
                       </div>
                     );
                   })}
@@ -2871,7 +3210,7 @@
               </button>
 
               <h3 id="share-confirm-title" className="text-lg font-bold text-white mb-1 pr-6">Confirm Health Profile Sharing</h3>
-              <p className="text-xs text-slate-400 leading-relaxed">Review exactly what will be shared before you confirm.</p>
+              <p className="text-xs text-slate-400 leading-relaxed">Review exactly what will be shared and what the verified provider may add before you confirm.</p>
 
               <div className="mt-5 flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-900/60 p-4">
                 {renderInitialAvatar(name, 'w-10 h-10 text-sm', target.id)}
@@ -2886,7 +3225,7 @@
               </div>
 
               <div className="mt-5">
-                <p className="text-[11px] font-semibold uppercase tracking-wider text-cyan-400 mb-2">They will be able to see</p>
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-cyan-400 mb-2">They will be able to view</p>
                 <div className="rounded-xl border border-slate-700 bg-slate-900/60 divide-y divide-slate-800">
                   {preview.map((item) => (
                     <div key={item.key} className="flex items-start justify-between gap-4 px-4 py-2.5">
@@ -2932,9 +3271,9 @@
               </div>
 
               <ul className="mt-4 space-y-1.5 text-[11px] text-slate-400 leading-relaxed list-disc pl-4">
-                <li>Access is read-only. They cannot change your profile.</li>
+                <li>They cannot edit your health profile fields.</li>
                 <li>They see your latest saved profile, including future updates, until you stop sharing.</li>
-                <li>All of your Medical Vault documents are included, along with any you upload later. They can open and download them, but cannot upload, change or delete anything.</li>
+                <li>They can open existing vault documents but cannot change or delete your files. If you enable contributions for that provider, they can add new documents to your vault and save private notes linked to your profile (visible only to the provider).</li>
                 <li>Your email address and messages are not shared.</li>
                 <li>You can stop sharing at any time from the Sharing tab. Anything they have already viewed or downloaded cannot be taken back.</li>
               </ul>
@@ -2948,7 +3287,7 @@
                   className="mt-0.5 h-4 w-4 accent-cyan-500 shrink-0"
                 />
                 <span className="text-xs text-slate-200 leading-relaxed">
-                  I confirm that I want to share my health profile and Medical Vault documents with <span className="font-semibold">{name}</span>.
+                  I confirm I want to share my health profile and Medical Vault documents with <span className="font-semibold">{name}</span>, and I allow them to add new documents to my vault and save private notes linked to this profile (visible only to the provider). They cannot edit profile fields or change/delete my existing files.
                 </span>
               </label>
 
@@ -2988,7 +3327,7 @@
                 <div>
                   <h2 className="text-xl font-bold text-white mb-1">Shared Health Profiles</h2>
                   <p className="text-xs text-slate-400 leading-relaxed max-w-2xl">
-                    Patients who have chosen to share their health profile and Medical Vault documents with you. Access is read-only and ends as soon as a patient stops sharing.
+                    Patients who have chosen to share their health profile and Medical Vault documents with you. They can view the shared profile. Providers can add documents and private notes only when the patient explicitly enables contributions; access ends when sharing stops.
                   </p>
                 </div>
                 <button
@@ -3059,7 +3398,7 @@
         );
       }
 
-      // Verified provider / institution: read-only view of one shared profile
+      // Verified provider / institution: view of a patient-shared profile, with patient-authorized document uploads and notes
       function renderSharedProfileModal() {
         const entry = viewingSharedProfile;
         const profile = entry.profile || {};
@@ -3084,7 +3423,7 @@
               </button>
 
               <span className="inline-block px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-cyan-400 bg-cyan-950/80 border border-cyan-800/60 rounded-full mb-3">
-                Shared by Patient · Read-only
+                Shared by Patient
               </span>
 
               <div className="flex items-center gap-3">
@@ -3097,6 +3436,8 @@
                   </p>
                 </div>
               </div>
+
+              <p className="mt-3 text-[10px] text-slate-500 leading-relaxed">The health profile fields below are view-only. Document uploads and private notes are enabled only when the patient grants contribution permission.</p>
 
               <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {fields.map((field) => {
@@ -3117,7 +3458,7 @@
                   <p className="text-[11px] font-semibold uppercase tracking-wider text-cyan-400">
                     Medical Vault Documents{!sharedVaultLoading && !sharedVaultError ? ` (${sharedVaultFiles.length})` : ''}
                   </p>
-                  <p className="text-[10px] text-slate-500">View &amp; download only</p>
+                  <p className="text-[10px] text-slate-500">Existing files can be opened, not changed or deleted</p>
                 </div>
 
                 {sharedVaultLoading ? (
@@ -3159,10 +3500,107 @@
                     ))}
                   </div>
                 )}
+
+                <div className="mt-3 rounded-xl border border-slate-700 bg-slate-900/50 p-4">
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="min-w-0">
+                      <h4 className="text-xs font-semibold text-white">Add a document to this patient's vault</h4>
+                      <p className="text-[10px] text-slate-500 mt-1">PDF, PNG, or JPG · Maximum 25 MB</p>
+                    </div>
+                    <input
+                      ref={sharedVaultUploadInputRef}
+                      type="file"
+                      accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg"
+                      className="hidden"
+                      onChange={(event) => handleSharedVaultUpload(event.target.files?.[0])}
+                      disabled={sharedVaultUploading || !sharedVaultWriteAllowed}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => sharedVaultUploadInputRef.current?.click()}
+                      disabled={sharedVaultUploading || sharedVaultWriteLoading || !sharedVaultWriteAllowed}
+                      className="px-3.5 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-[10px] font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {sharedVaultUploading ? 'Uploading...' : 'Add Document'}
+                    </button>
+                  </div>
+                  {sharedVaultWriteLoading ? (
+                    <p className="text-[10px] text-slate-500 mt-3">Checking patient contribution permission...</p>
+                  ) : !sharedVaultWriteAllowed ? (
+                    <p className="text-[10px] text-amber-300 mt-3 leading-relaxed">
+                      {sharedVaultWriteError || 'The patient has not enabled provider uploads and notes for this share. Ask them to open Sharing and select “Enable Uploads & Notes” next to your account.'}
+                    </p>
+                  ) : null}
+                  {sharedVaultUploadMessage && <p role="status" className="text-[10px] text-emerald-300 mt-3">{sharedVaultUploadMessage}</p>}
+                  {sharedVaultUploadError && <p role="alert" className="text-[10px] text-red-300 mt-3 leading-relaxed break-words">{sharedVaultUploadError}</p>}
+                </div>
               </div>
 
+              <section className="mt-5 rounded-xl border border-slate-700 bg-slate-900/50 p-4">
+                <div className="mb-3">
+                  <h4 className="text-xs font-semibold text-white">Provider Notes for {name}</h4>
+                  <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">These notes are private to you and are attached to this shared patient profile. The patient and other providers cannot see them.</p>
+                </div>
+                <form onSubmit={handleSaveSharedPatientNote} className="space-y-3">
+                  <textarea
+                    value={sharedPatientNoteDraft}
+                    onChange={(event) => setSharedPatientNoteDraft(event.target.value.slice(0, 10000))}
+                    maxLength={10000}
+                    rows={3}
+                    placeholder="Add a private note about this shared profile..."
+                    disabled={!sharedVaultWriteAllowed || sharedVaultWriteLoading || savingSharedPatientNote}
+                    className="w-full resize-y rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-100 placeholder-slate-500 outline-none focus:border-cyan-500 disabled:opacity-50"
+                  />
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <p className="text-[10px] text-slate-500">{sharedPatientNoteDraft.length.toLocaleString()} / 10,000 characters</p>
+                    <button
+                      type="submit"
+                      disabled={!sharedVaultWriteAllowed || sharedVaultWriteLoading || savingSharedPatientNote || !sharedPatientNoteDraft.trim()}
+                      className="px-3.5 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-[10px] font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {savingSharedPatientNote ? 'Saving...' : 'Save Note'}
+                    </button>
+                  </div>
+                </form>
+                {!sharedVaultWriteAllowed && !sharedVaultWriteLoading && (
+                  <p className="text-[10px] text-amber-300 mt-2 leading-relaxed">{sharedVaultWriteError || 'The patient must enable uploads and notes before you can add a note here.'}</p>
+                )}
+                {sharedPatientNotesMessage && <p role="status" className="text-[10px] text-emerald-300 mt-3">{sharedPatientNotesMessage}</p>}
+                {sharedPatientNotesError && <p role="alert" className="text-[10px] text-red-300 mt-3 leading-relaxed break-words">{sharedPatientNotesError}</p>}
+                <div className="mt-4 border-t border-slate-700 pt-3">
+                  <div className="flex items-center justify-between gap-3 mb-3">
+                    <h5 className="text-[11px] font-semibold text-slate-200">Saved Notes</h5>
+                    <span className="text-[10px] text-slate-500">{sharedPatientNotes.length}</span>
+                  </div>
+                  {sharedPatientNotesLoading ? (
+                    <p className="py-3 text-center text-[10px] text-slate-500">Loading notes...</p>
+                  ) : sharedPatientNotes.length === 0 ? (
+                    <p className="py-3 text-center text-[10px] text-slate-500">No notes saved for this profile yet.</p>
+                  ) : (
+                    <div className="space-y-2">
+                      {sharedPatientNotes.map((note) => (
+                        <article key={note.id} className="rounded-lg border border-slate-700 bg-slate-950/50 p-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <p className="text-[9px] text-slate-500">{note.created_at ? new Date(note.created_at).toLocaleString() : 'Saved note'}</p>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteSharedPatientNote(note)}
+                              disabled={deletingSharedPatientNoteId === note.id}
+                              className="text-[9px] font-semibold text-red-300 hover:text-red-200 disabled:opacity-50"
+                            >
+                              {deletingSharedPatientNoteId === note.id ? 'Deleting...' : 'Delete'}
+                            </button>
+                          </div>
+                          <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-relaxed text-slate-200">{note.note_text}</p>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </section>
+
               <p className="mt-4 text-[10px] text-slate-500 leading-relaxed">
-                This patient chose to share this information and these documents with you. Your access ends automatically if they stop sharing.
+                The patient controls contribution access. Their profile fields and existing vault files cannot be edited by you. Your access and ability to contribute end when the patient stops sharing.
               </p>
 
               <div className="mt-5 pt-5 border-t border-slate-700 flex items-center justify-end gap-2">
