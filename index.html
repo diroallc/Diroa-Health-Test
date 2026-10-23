@@ -35,6 +35,27 @@
     const MAX_PROFILE_PHOTO_SIZE = 5 * 1024 * 1024; // 5 MB
     const ALLOWED_PROFILE_PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 
+    // Messaging attachments use a separate private bucket so this feature does
+    // not change the access rules or behavior of the existing medical vault.
+    const MESSAGE_ATTACHMENT_BUCKET = 'message-attachments';
+    const MESSAGE_ATTACHMENT_MARKER = '__DIROA_MESSAGE_ATTACHMENT_V1__';
+    const MAX_MESSAGE_ATTACHMENT_SIZE = 25 * 1024 * 1024; // 25 MB
+    const MESSAGE_ATTACHMENT_MIME_BY_EXTENSION = {
+      '.pdf': 'application/pdf',
+      '.doc': 'application/msword',
+      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      '.txt': 'text/plain',
+      '.rtf': 'application/rtf',
+      '.csv': 'text/csv',
+      '.xls': 'application/vnd.ms-excel',
+      '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      '.ppt': 'application/vnd.ms-powerpoint',
+      '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg'
+    };
+
     const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 
@@ -817,6 +838,29 @@
       return SHARED_PROFILE_FIELDS.find((field) => field.key === key)?.label || key;
     }
 
+    // Attachment messages are stored in the existing messages.body field with
+    // a recognizable prefix. Plain-text messages continue to use the original
+    // format and require no database schema changes.
+    function parseMessageAttachment(body) {
+      const value = String(body || '');
+      if (!value.startsWith(MESSAGE_ATTACHMENT_MARKER)) return null;
+      try {
+        const attachment = JSON.parse(value.slice(MESSAGE_ATTACHMENT_MARKER.length));
+        if (!attachment || typeof attachment.path !== 'string' || typeof attachment.name !== 'string') return null;
+        return attachment;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function formatMessageFileSize(bytes) {
+      const size = Number(bytes);
+      if (!Number.isFinite(size) || size < 0) return '';
+      if (size < 1024) return `${size} B`;
+      if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+      return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+    }
+
 
     // =========================================================================
     // 5. MAIN REACT APPLICATION
@@ -855,7 +899,10 @@
       const [conversationsLoading, setConversationsLoading] = React.useState(false);
       const [messageText, setMessageText] = React.useState('');
       const [sendingMessage, setSendingMessage] = React.useState(false);
+      const [sendingAttachment, setSendingAttachment] = React.useState(false);
+      const [downloadingMessageAttachmentPath, setDownloadingMessageAttachmentPath] = React.useState('');
       const [messageError, setMessageError] = React.useState('');
+      const messageFileInputRef = React.useRef(null);
       const messagesEndRef = React.useRef(null);
       const activeConversationIdRef = React.useRef(null);
       const hasLoadedConversationsRef = React.useRef(false);
@@ -3018,7 +3065,7 @@
         event?.preventDefault();
 
         const cleanBody = messageText.trim();
-        if (!cleanBody || !user || !activeConversationId || sendingMessage) return;
+        if (!cleanBody || !user || !activeConversationId || sendingMessage || sendingAttachment) return;
 
         setSendingMessage(true);
         setMessageError('');
@@ -3036,6 +3083,140 @@
           setMessageError(error?.message || 'Message could not be sent.');
         } finally {
           setSendingMessage(false);
+        }
+      }
+
+      async function handleSendMessageAttachment(event) {
+        const input = event?.currentTarget;
+        const file = input?.files?.[0];
+        if (input) input.value = '';
+        if (!file) return;
+
+        if (!user || !activeConversationId) {
+          setMessageError('Open a conversation before attaching a document.');
+          return;
+        }
+        if (sendingMessage || sendingAttachment) return;
+
+        const recipientId = activeConversationId;
+        const caption = messageText.trim();
+        const lastDot = file.name.lastIndexOf('.');
+        const extension = lastDot >= 0 ? file.name.slice(lastDot).toLowerCase() : '';
+        const contentType = MESSAGE_ATTACHMENT_MIME_BY_EXTENSION[extension];
+
+        if (!contentType) {
+          setMessageError('This file type is not supported. Use PDF, Word, text, CSV/Excel, PowerPoint, PNG, or JPG.');
+          return;
+        }
+        if (file.size > MAX_MESSAGE_ATTACHMENT_SIZE) {
+          setMessageError('The file is too large. Maximum attachment size is 25 MB.');
+          return;
+        }
+        if (file.size === 0) {
+          setMessageError('This file is empty. Choose a different file.');
+          return;
+        }
+
+        setSendingAttachment(true);
+        setMessageError('');
+        let uploadedPath = '';
+
+        try {
+          const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 160) || `attachment${extension}`;
+          const uniqueId = (window.crypto && typeof window.crypto.randomUUID === 'function')
+            ? window.crypto.randomUUID()
+            : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+          // The first folder is the signed-in sender ID, matching the private
+          // bucket's insert policy. The recipient gets access through the sent
+          // message's attachment metadata, not through public bucket access.
+          uploadedPath = `${user.id}/chat/${uniqueId}-${safeName}`;
+
+          const { error: uploadError } = await supabase
+            .storage
+            .from(MESSAGE_ATTACHMENT_BUCKET)
+            .upload(uploadedPath, file, {
+              cacheControl: '3600',
+              upsert: false,
+              contentType
+            });
+
+          if (uploadError) throw uploadError;
+
+          const attachmentBody = MESSAGE_ATTACHMENT_MARKER + JSON.stringify({
+            path: uploadedPath,
+            name: file.name,
+            size: file.size,
+            type: contentType,
+            caption
+          });
+          const newMessage = await insertMessage(user.id, recipientId, attachmentBody);
+          if (!newMessage) throw new Error('The file uploaded, but its message could not be created.');
+
+          if (activeConversationIdRef.current === recipientId) {
+            setConversationMessages((current) => [...current, newMessage]);
+            window.setTimeout(() => {
+              messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+            }, 0);
+          }
+          if (messageText.trim() === caption) setMessageText('');
+        } catch (error) {
+          console.error('Message attachment send error:', error);
+          if (uploadedPath) {
+            try {
+              await supabase.storage.from(MESSAGE_ATTACHMENT_BUCKET).remove([uploadedPath]);
+            } catch (cleanupError) {
+              console.warn('Could not clean up an unsent message attachment:', cleanupError);
+            }
+          }
+          const detail = error?.message || 'Unknown upload error.';
+          setMessageError(`Could not send the attachment: ${detail}. If the attachment bucket has not been set up yet, run diroa-messaging-attachments.sql in Supabase first.`);
+        } finally {
+          setSendingAttachment(false);
+        }
+      }
+
+      async function handleDownloadMessageAttachment(attachment, senderId) {
+        if (!user || !attachment?.path || !senderId) return;
+        // Prevent message metadata from being used to request a signed link for
+        // an unrelated file outside the sender's chat-attachment folder.
+        if (!attachment.path.startsWith(`${senderId}/chat/`)) {
+          setMessageError('This attachment link is invalid.');
+          return;
+        }
+
+        setDownloadingMessageAttachmentPath(attachment.path);
+        setMessageError('');
+        // Open the tab synchronously from the click so browsers do not block it
+        // while Supabase generates the short-lived, private download URL.
+        const downloadWindow = window.open('about:blank', '_blank');
+
+        try {
+          const { data, error } = await supabase
+            .storage
+            .from(MESSAGE_ATTACHMENT_BUCKET)
+            .createSignedUrl(attachment.path, 60 * 10);
+          if (error) throw error;
+          if (!data?.signedUrl) throw new Error('No download link was returned.');
+
+          if (downloadWindow && !downloadWindow.closed) {
+            downloadWindow.opener = null;
+            downloadWindow.location.href = data.signedUrl;
+          } else {
+            const link = document.createElement('a');
+            link.href = data.signedUrl;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.download = attachment.name || '';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+          }
+        } catch (error) {
+          if (downloadWindow && !downloadWindow.closed) downloadWindow.close();
+          console.error('Message attachment download error:', error);
+          setMessageError(error?.message || 'Could not open this attachment.');
+        } finally {
+          setDownloadingMessageAttachmentPath('');
         }
       }
 
@@ -3078,7 +3259,11 @@
       }
 
       function formatConversationPreview(text) {
-        const clean = (text || '').replace(/\s+/g, ' ').trim();
+        const attachment = parseMessageAttachment(text);
+        const previewText = attachment
+          ? `📎 ${attachment.name}${attachment.caption ? ` — ${attachment.caption}` : ''}`
+          : (text || '');
+        const clean = previewText.replace(/\s+/g, ' ').trim();
         return clean.length > 48 ? clean.slice(0, 48) + '…' : clean;
       }
 
@@ -5201,10 +5386,41 @@
 
                               {conversationMessages.map((message) => {
                                 const mine = message.sender_id === user.id;
+                                const attachment = parseMessageAttachment(message.body);
+                                const isDownloading = attachment && downloadingMessageAttachmentPath === attachment.path;
                                 return (
                                   <div key={message.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
                                     <div className={`max-w-[80%] rounded-2xl px-4 py-2.5 ${mine ? 'bg-cyan-600 text-white rounded-br-md' : 'bg-slate-800 border border-slate-700 text-slate-100 rounded-bl-md'}`}>
-                                      <p className="text-xs leading-relaxed whitespace-pre-wrap break-words">{message.body}</p>
+                                      {attachment ? (
+                                        <div className="min-w-[210px] max-w-full">
+                                          {attachment.caption ? (
+                                            <p className="text-xs leading-relaxed whitespace-pre-wrap break-words mb-2">{attachment.caption}</p>
+                                          ) : null}
+                                          <button
+                                            type="button"
+                                            onClick={() => handleDownloadMessageAttachment(attachment, message.sender_id)}
+                                            disabled={Boolean(isDownloading)}
+                                            title={`Open ${attachment.name}`}
+                                            className={`w-full flex items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition ${mine ? 'border-cyan-100/30 bg-cyan-700/50 hover:bg-cyan-700' : 'border-slate-600 bg-slate-900 hover:bg-slate-800'} disabled:opacity-60`}
+                                          >
+                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="w-5 h-5 shrink-0">
+                                              <path strokeLinecap="round" strokeLinejoin="round" d="M7 3.75h6l4.25 4.25v12A1.5 1.5 0 0 1 15.75 21.5h-9.5A1.5 1.5 0 0 1 4.75 20V5.25A1.5 1.5 0 0 1 6.25 3.75Z" />
+                                              <path strokeLinecap="round" strokeLinejoin="round" d="M13 4v4.5h4.5M8 13h8M8 16h6" />
+                                            </svg>
+                                            <span className="min-w-0 flex-1">
+                                              <span className="block text-xs font-semibold break-words">{attachment.name}</span>
+                                              <span className={`block text-[10px] mt-0.5 ${mine ? 'text-cyan-100/80' : 'text-slate-400'}`}>
+                                                {formatMessageFileSize(attachment.size)}{isDownloading ? ' · Opening…' : ' · Click to open'}
+                                              </span>
+                                            </span>
+                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-4 h-4 shrink-0">
+                                              <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v12m0 0 4-4m-4 4-4-4M5 17v3h14v-3" />
+                                            </svg>
+                                          </button>
+                                        </div>
+                                      ) : (
+                                        <p className="text-xs leading-relaxed whitespace-pre-wrap break-words">{message.body}</p>
+                                      )}
                                       <p className={`text-[9px] mt-1.5 ${mine ? 'text-cyan-100/70' : 'text-slate-500'}`}>{formatMessageTime(message.created_at)}</p>
                                     </div>
                                   </div>
@@ -5218,7 +5434,24 @@
                             )}
 
                             <form onSubmit={handleSendMessage} className="p-4 border-t border-slate-700 bg-slate-900/70">
+                              <input
+                                ref={messageFileInputRef}
+                                type="file"
+                                accept=".pdf,.doc,.docx,.txt,.rtf,.csv,.xls,.xlsx,.ppt,.pptx,.png,.jpg,.jpeg"
+                                className="hidden"
+                                onChange={handleSendMessageAttachment}
+                              />
                               <div className="flex items-end gap-2 rounded-xl border border-slate-700 bg-slate-950/80 p-2 focus-within:border-cyan-500/60">
+                                <button
+                                  type="button"
+                                  onClick={() => messageFileInputRef.current?.click()}
+                                  disabled={sendingAttachment || sendingMessage || !activeConversationId}
+                                  title="Attach and send a document"
+                                  aria-label="Add file to message"
+                                  className="shrink-0 h-9 px-3 rounded-lg border border-slate-700 bg-slate-800 text-slate-300 hover:text-white hover:border-cyan-500/60 transition disabled:opacity-40 disabled:cursor-not-allowed text-[11px] font-semibold"
+                                >
+                                  {sendingAttachment ? 'Uploading…' : '＋ Add file'}
+                                </button>
                                 <textarea
                                   value={messageText}
                                   onChange={(e) => setMessageText(e.target.value.slice(0, 5000))}
@@ -5228,19 +5461,20 @@
                                       handleSendMessage(e);
                                     }
                                   }}
+                                  disabled={sendingAttachment}
                                   rows="1"
-                                  placeholder="Write a message..."
-                                  className="flex-1 max-h-32 resize-none bg-transparent px-2 py-1.5 text-xs text-slate-100 placeholder-slate-600 focus:outline-none"
+                                  placeholder={sendingAttachment ? 'Sending attachment…' : 'Write a message...'}
+                                  className="flex-1 max-h-32 resize-none bg-transparent px-2 py-1.5 text-xs text-slate-100 placeholder-slate-600 focus:outline-none disabled:opacity-60"
                                 />
                                 <button
                                   type="submit"
-                                  disabled={sendingMessage || !messageText.trim()}
+                                  disabled={sendingMessage || sendingAttachment || !messageText.trim()}
                                   className="shrink-0 px-4 h-9 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-[11px] font-semibold transition disabled:opacity-40 disabled:cursor-not-allowed"
                                 >
                                   {sendingMessage ? 'Sending...' : 'Send'}
                                 </button>
                               </div>
-                              <p className="text-[9px] text-slate-600 mt-1.5 px-1">Enter to send · Shift+Enter for a new line</p>
+                              <p className="text-[9px] text-slate-600 mt-1.5 px-1">Enter to send · Shift+Enter for a new line · Attachments up to 25 MB</p>
                             </form>
                           </>
                         ) : (
