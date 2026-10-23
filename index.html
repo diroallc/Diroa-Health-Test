@@ -876,10 +876,16 @@
       const [sharedPatientNotes, setSharedPatientNotes] = React.useState([]);
       const [sharedPatientNotesLoading, setSharedPatientNotesLoading] = React.useState(false);
       const [sharedPatientNoteDraft, setSharedPatientNoteDraft] = React.useState('');
+      const [sharedPatientNoteVisibility, setSharedPatientNoteVisibility] = React.useState('private');
       const [savingSharedPatientNote, setSavingSharedPatientNote] = React.useState(false);
       const [deletingSharedPatientNoteId, setDeletingSharedPatientNoteId] = React.useState(null);
       const [sharedPatientNotesError, setSharedPatientNotesError] = React.useState('');
       const [sharedPatientNotesMessage, setSharedPatientNotesMessage] = React.useState('');
+
+      // Patient-facing instructions: only notes explicitly marked visible to the patient are loaded here.
+      const [patientVisibleNotes, setPatientVisibleNotes] = React.useState([]);
+      const [patientVisibleNotesLoading, setPatientVisibleNotesLoading] = React.useState(false);
+      const [patientVisibleNotesError, setPatientVisibleNotesError] = React.useState('');
 
       // Patient-managed consent controls which providers may add files / notes to a shared profile.
       const [providerWriteConsents, setProviderWriteConsents] = React.useState([]);
@@ -944,8 +950,12 @@
             setSharedVaultUploadError('');
             setSharedPatientNotes([]);
             setSharedPatientNoteDraft('');
+            setSharedPatientNoteVisibility('private');
             setSharedPatientNotesError('');
             setSharedPatientNotesMessage('');
+            setPatientVisibleNotes([]);
+            setPatientVisibleNotesLoading(false);
+            setPatientVisibleNotesError('');
             setProviderWriteConsents([]);
             setWriteConsentBusyId(null);
           }
@@ -1030,6 +1040,16 @@
         }
       }, [activeTab, user, canUseApp, accountType, verificationStatus]);
 
+
+      // =========================================================================
+      // 8b. LOAD PATIENT-VISIBLE PROVIDER NOTES
+      // =========================================================================
+
+      React.useEffect(() => {
+        if (user && canUseApp && accountType === 'patient' && activeTab === 'dashboard') {
+          loadPatientVisibleNotes(user.id);
+        }
+      }, [activeTab, user?.id, canUseApp, accountType]);
 
       // =========================================================================
       // 9. LOAD MESSAGES / CONVERSATIONS
@@ -1408,6 +1428,7 @@
         setSharedPatientNotesError('');
         setSharedPatientNotesMessage('');
         setSharedPatientNoteDraft('');
+        setSharedPatientNoteVisibility('private');
 
         (async () => {
           const { data: consent, error: consentError } = await supabase
@@ -1431,7 +1452,7 @@
 
           const { data: notes, error: notesError } = await supabase
             .from('provider_patient_notes')
-            .select('id, patient_id, provider_id, note_text, created_at')
+            .select('id, patient_id, provider_id, note_text, visibility, created_at')
             .eq('patient_id', patientId)
             .eq('provider_id', user.id)
             .order('created_at', { ascending: false });
@@ -1440,7 +1461,7 @@
           if (notesError) {
             console.error('Shared patient notes load error:', notesError.message);
             setSharedPatientNotes([]);
-            setSharedPatientNotesError('Patient-linked notes are not set up yet. Run the updated shared-profile access SQL in Supabase, then reload.');
+            setSharedPatientNotesError('Patient-linked notes are not set up yet, or the visibility column is missing. Run diroa-provider-patient-visible-notes.sql in Supabase, then reload.');
           } else {
             setSharedPatientNotes(notes || []);
             setSharedPatientNotesError('');
@@ -1546,8 +1567,8 @@
         const enabled = hasProviderWriteConsent(providerId);
         const providerName = share.profile?.display_name || 'this provider / institution';
         const prompt = enabled
-          ? `Disable new document uploads and provider notes for ${providerName}? Existing documents already added to your vault will remain there.`
-          : `Allow ${providerName} to add new documents to your Medical Vault and save private notes linked to your shared profile (only visible to that provider)? They still cannot edit your profile fields or change/delete your existing files.`;
+          ? `Disable new document uploads and provider notes for ${providerName}? Existing documents and notes already saved will remain in the record, but the provider will no longer be able to add more.`
+          : `Allow ${providerName} to add new documents, write notes visible to you, and keep separate private provider notes? They still cannot edit your profile fields or change/delete your existing files.`;
         if (!window.confirm(prompt)) return;
 
         setWriteConsentBusyId(providerId);
@@ -1579,7 +1600,7 @@
               .single();
             if (error) throw error;
             setProviderWriteConsents((previous) => [...previous.filter((item) => item.provider_id !== providerId), data]);
-            setShareNotice(`${providerName} can now add documents and private notes while you continue sharing your profile.`);
+            setShareNotice(`${providerName} can now add documents, patient-visible notes, and private provider notes while you continue sharing your profile.`);
           }
         } catch (error) {
           console.error('Provider contribution consent update error:', error);
@@ -1924,15 +1945,18 @@
         setSharedPatientNotesError('');
         setSharedPatientNotesMessage('');
         try {
+          const visibility = sharedPatientNoteVisibility === 'patient' ? 'patient' : 'private';
           const { data, error } = await supabase
             .from('provider_patient_notes')
-            .insert({ patient_id: patientId, provider_id: user.id, note_text: noteText })
-            .select('id, patient_id, provider_id, note_text, created_at')
+            .insert({ patient_id: patientId, provider_id: user.id, note_text: noteText, visibility })
+            .select('id, patient_id, provider_id, note_text, visibility, created_at')
             .single();
           if (error) throw error;
           setSharedPatientNotes((previous) => [data, ...previous]);
           setSharedPatientNoteDraft('');
-          setSharedPatientNotesMessage('Private note saved to this shared patient profile.');
+          setSharedPatientNotesMessage(visibility === 'patient'
+            ? 'Patient note saved. The patient can see it in Provider Instructions & Patient Notes on their dashboard.'
+            : 'Private provider note saved. The patient cannot see it.');
         } catch (error) {
           console.error('Save shared patient note error:', error);
           setSharedPatientNotesError(error?.message || 'Could not save this note. Confirm the patient still shares their profile and has enabled contributions.');
@@ -1961,6 +1985,55 @@
           setSharedPatientNotesError(error?.message || 'Could not delete this note.');
         } finally {
           setDeletingSharedPatientNoteId(null);
+        }
+      }
+
+      // =========================================================================
+      // 10a. PATIENT-VISIBLE PROVIDER NOTES
+      // =========================================================================
+
+      async function loadPatientVisibleNotes(userId) {
+        if (!userId || accountType !== 'patient') {
+          setPatientVisibleNotes([]);
+          return;
+        }
+
+        setPatientVisibleNotesLoading(true);
+        setPatientVisibleNotesError('');
+        try {
+          const { data, error } = await supabase
+            .from('provider_patient_notes')
+            .select('id, patient_id, provider_id, note_text, visibility, created_at')
+            .eq('patient_id', userId)
+            .eq('visibility', 'patient')
+            .order('created_at', { ascending: false })
+            .limit(100);
+
+          if (error) throw error;
+
+          const notes = data || [];
+          let directoryById = {};
+          try {
+            const providers = await fetchProfilesByIds(notes.map((note) => note.provider_id));
+            providers.forEach((provider) => { directoryById[provider.id] = provider; });
+          } catch (profileError) {
+            console.warn('Could not load provider names for patient notes:', profileError?.message || profileError);
+          }
+
+          setPatientVisibleNotes(notes.map((note) => ({
+            ...note,
+            provider_profile: directoryById[note.provider_id] || null
+          })));
+        } catch (error) {
+          console.error('Patient-visible notes load error:', error);
+          setPatientVisibleNotes([]);
+          if (['42P01', 'PGRST205', '42501'].includes(error?.code) || /provider_patient_notes|permission denied|row-level security/i.test(error?.message || '')) {
+            setPatientVisibleNotesError('Provider instructions are not set up yet or database access is missing. Run diroa-provider-patient-visible-notes.sql in the Supabase SQL Editor, then reload.');
+          } else {
+            setPatientVisibleNotesError(error?.message || 'Could not load provider instructions.');
+          }
+        } finally {
+          setPatientVisibleNotesLoading(false);
         }
       }
 
@@ -2978,14 +3051,14 @@
             <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 shadow-xl">
               <h2 className="text-xl font-bold text-white mb-1">Share Your Health Profile</h2>
               <p className="text-xs text-slate-400 mb-4 leading-relaxed max-w-2xl">
-                Share your health profile and Medical Vault with a verified provider or institution. You can allow that provider to add new vault documents and save private notes linked to your profile (those notes are visible only to that provider); they cannot edit your profile fields or change/delete your existing files. Nothing is shared until you review and confirm, and you can stop sharing at any time.
+                Share your health profile and Medical Vault with a verified provider or institution. If you enable contributions, they can add documents, write patient-visible instructions that appear on your dashboard, and keep separate private provider notes that only they can see. They cannot edit your profile fields or change/delete your existing files. Nothing is shared until you review and confirm, and you can stop sharing at any time.
               </p>
 
               <div className="mb-5 grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div className="rounded-lg border border-slate-700 bg-slate-900/50 p-3">
                   <p className="text-[10px] font-semibold uppercase tracking-wider text-cyan-400 mb-1">Shared</p>
                   <p className="text-[11px] text-slate-300 leading-relaxed">
-                    {SHARED_PROFILE_FIELDS.map((field) => field.label).join(', ')}, and your Medical Vault documents. With your explicit permission, the provider can add new documents and private notes that only the provider can see; existing files remain protected.
+                    {SHARED_PROFILE_FIELDS.map((field) => field.label).join(', ')}, and your Medical Vault documents. With your permission, the provider can add documents, leave notes visible to you, and save separate private notes; existing files remain protected.
                   </p>
                 </div>
                 <div className="rounded-lg border border-slate-700 bg-slate-900/50 p-3">
@@ -3098,7 +3171,7 @@
                 <div>
                   <h3 className="text-sm font-bold text-white">Who Can See Your Health Profile</h3>
                   <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
-                    Each can view your latest saved profile and existing Medical Vault documents. You separately control whether each provider can add new documents and private notes.
+                    Each can view your latest saved profile and existing Medical Vault documents. You separately control whether each provider can add new documents and leave patient-visible notes or private provider notes.
                   </p>
                 </div>
                 <button
@@ -3148,7 +3221,7 @@
                           )}
                           <p className="text-[10px] mt-1 leading-relaxed">
                             <span className={hasProviderWriteConsent(share.recipient_id) ? 'text-emerald-300' : 'text-slate-500'}>
-                              {hasProviderWriteConsent(share.recipient_id) ? 'Provider uploads and private notes are enabled.' : 'Provider uploads and private notes are disabled.'}
+                              {hasProviderWriteConsent(share.recipient_id) ? 'Provider uploads, patient-visible notes, and private notes are enabled.' : 'Provider uploads and notes are disabled.'}
                             </span>
                           </p>
                         </div>
@@ -3273,7 +3346,7 @@
               <ul className="mt-4 space-y-1.5 text-[11px] text-slate-400 leading-relaxed list-disc pl-4">
                 <li>They cannot edit your health profile fields.</li>
                 <li>They see your latest saved profile, including future updates, until you stop sharing.</li>
-                <li>They can open existing vault documents but cannot change or delete your files. If you enable contributions for that provider, they can add new documents to your vault and save private notes linked to your profile (visible only to the provider).</li>
+                <li>They can open existing vault documents but cannot change or delete your files. If you enable contributions for that provider, they can add new documents, leave notes visible to you, and keep separate private provider notes.</li>
                 <li>Your email address and messages are not shared.</li>
                 <li>You can stop sharing at any time from the Sharing tab. Anything they have already viewed or downloaded cannot be taken back.</li>
               </ul>
@@ -3287,7 +3360,7 @@
                   className="mt-0.5 h-4 w-4 accent-cyan-500 shrink-0"
                 />
                 <span className="text-xs text-slate-200 leading-relaxed">
-                  I confirm I want to share my health profile and Medical Vault documents with <span className="font-semibold">{name}</span>, and I allow them to add new documents to my vault and save private notes linked to this profile (visible only to the provider). They cannot edit profile fields or change/delete my existing files.
+                  I confirm I want to share my health profile and Medical Vault documents with <span className="font-semibold">{name}</span>. I also allow them to add documents, leave notes visible to me, and save separate private provider notes. They cannot edit profile fields or change/delete my existing files.
                 </span>
               </label>
 
@@ -3327,7 +3400,7 @@
                 <div>
                   <h2 className="text-xl font-bold text-white mb-1">Shared Health Profiles</h2>
                   <p className="text-xs text-slate-400 leading-relaxed max-w-2xl">
-                    Patients who have chosen to share their health profile and Medical Vault documents with you. They can view the shared profile. Providers can add documents and private notes only when the patient explicitly enables contributions; access ends when sharing stops.
+                    Patients who have chosen to share their health profile and Medical Vault documents with you. When a patient enables contributions, you can add documents, write notes visible to the patient, and save separate private provider notes. Access to the shared profile ends when sharing stops.
                   </p>
                 </div>
                 <button
@@ -3437,7 +3510,7 @@
                 </div>
               </div>
 
-              <p className="mt-3 text-[10px] text-slate-500 leading-relaxed">The health profile fields below are view-only. Document uploads and private notes are enabled only when the patient grants contribution permission.</p>
+              <p className="mt-3 text-[10px] text-slate-500 leading-relaxed">The health profile fields below are view-only. Document uploads and both patient-visible and private notes are enabled only when the patient grants contribution permission.</p>
 
               <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {fields.map((field) => {
@@ -3538,16 +3611,43 @@
 
               <section className="mt-5 rounded-xl border border-slate-700 bg-slate-900/50 p-4">
                 <div className="mb-3">
-                  <h4 className="text-xs font-semibold text-white">Provider Notes for {name}</h4>
-                  <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">These notes are private to you and are attached to this shared patient profile. The patient and other providers cannot see them.</p>
+                  <h4 className="text-xs font-semibold text-white">Notes for {name}</h4>
+                  <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">Choose whether this note is patient-facing or private. Patient notes appear on the patient's dashboard. Private provider notes are visible only to you. Other providers cannot see notes you wrote.</p>
                 </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
+                  <button
+                    type="button"
+                    onClick={() => setSharedPatientNoteVisibility('patient')}
+                    disabled={!sharedVaultWriteAllowed || sharedVaultWriteLoading || savingSharedPatientNote}
+                    aria-pressed={sharedPatientNoteVisibility === 'patient'}
+                    className={`rounded-lg border p-3 text-left transition disabled:opacity-50 ${sharedPatientNoteVisibility === 'patient' ? 'border-cyan-600 bg-cyan-950/50 text-cyan-200' : 'border-slate-700 bg-slate-950/50 text-slate-300 hover:border-slate-500'}`}
+                  >
+                    <span className="block text-[11px] font-semibold">Patient Note</span>
+                    <span className="block mt-1 text-[9px] opacity-80">Visible to the patient</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSharedPatientNoteVisibility('private')}
+                    disabled={!sharedVaultWriteAllowed || sharedVaultWriteLoading || savingSharedPatientNote}
+                    aria-pressed={sharedPatientNoteVisibility === 'private'}
+                    className={`rounded-lg border p-3 text-left transition disabled:opacity-50 ${sharedPatientNoteVisibility === 'private' ? 'border-fuchsia-700 bg-fuchsia-950/40 text-fuchsia-200' : 'border-slate-700 bg-slate-950/50 text-slate-300 hover:border-slate-500'}`}
+                  >
+                    <span className="block text-[11px] font-semibold">Private Provider Note</span>
+                    <span className="block mt-1 text-[9px] opacity-80">Only you can see it</span>
+                  </button>
+                </div>
+                <p className="mb-3 text-[10px] text-slate-500 leading-relaxed">
+                  {sharedPatientNoteVisibility === 'patient'
+                    ? 'Use this for care instructions, next steps, follow-up guidance, or information the patient should see.'
+                    : 'Use this for private working notes. The patient and other providers cannot see this note.'}
+                </p>
                 <form onSubmit={handleSaveSharedPatientNote} className="space-y-3">
                   <textarea
                     value={sharedPatientNoteDraft}
                     onChange={(event) => setSharedPatientNoteDraft(event.target.value.slice(0, 10000))}
                     maxLength={10000}
                     rows={3}
-                    placeholder="Add a private note about this shared profile..."
+                    placeholder={sharedPatientNoteVisibility === 'patient' ? 'Write care instructions or a note for the patient...' : 'Add a private provider note...'}
                     disabled={!sharedVaultWriteAllowed || sharedVaultWriteLoading || savingSharedPatientNote}
                     className="w-full resize-y rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-100 placeholder-slate-500 outline-none focus:border-cyan-500 disabled:opacity-50"
                   />
@@ -3558,7 +3658,7 @@
                       disabled={!sharedVaultWriteAllowed || sharedVaultWriteLoading || savingSharedPatientNote || !sharedPatientNoteDraft.trim()}
                       className="px-3.5 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-[10px] font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      {savingSharedPatientNote ? 'Saving...' : 'Save Note'}
+                      {savingSharedPatientNote ? 'Saving...' : sharedPatientNoteVisibility === 'patient' ? 'Save Patient Note' : 'Save Private Note'}
                     </button>
                   </div>
                 </form>
@@ -3569,7 +3669,7 @@
                 {sharedPatientNotesError && <p role="alert" className="text-[10px] text-red-300 mt-3 leading-relaxed break-words">{sharedPatientNotesError}</p>}
                 <div className="mt-4 border-t border-slate-700 pt-3">
                   <div className="flex items-center justify-between gap-3 mb-3">
-                    <h5 className="text-[11px] font-semibold text-slate-200">Saved Notes</h5>
+                    <h5 className="text-[11px] font-semibold text-slate-200">Your Saved Notes for This Patient</h5>
                     <span className="text-[10px] text-slate-500">{sharedPatientNotes.length}</span>
                   </div>
                   {sharedPatientNotesLoading ? (
@@ -3581,7 +3681,12 @@
                       {sharedPatientNotes.map((note) => (
                         <article key={note.id} className="rounded-lg border border-slate-700 bg-slate-950/50 p-3">
                           <div className="flex items-start justify-between gap-3">
-                            <p className="text-[9px] text-slate-500">{note.created_at ? new Date(note.created_at).toLocaleString() : 'Saved note'}</p>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className={`inline-flex rounded-full border px-2 py-1 text-[9px] font-bold uppercase tracking-wide ${note.visibility === 'patient' ? 'border-cyan-800/70 bg-cyan-950/60 text-cyan-300' : 'border-fuchsia-800/70 bg-fuchsia-950/40 text-fuchsia-300'}`}>
+                                {note.visibility === 'patient' ? 'Visible to patient' : 'Private to you'}
+                              </span>
+                              <p className="text-[9px] text-slate-500">{note.created_at ? new Date(note.created_at).toLocaleString() : 'Saved note'}</p>
+                            </div>
                             <button
                               type="button"
                               onClick={() => handleDeleteSharedPatientNote(note)}
@@ -3999,6 +4104,59 @@
                         </p>
                       </div>
                     </div>
+
+                    {/* Provider instructions / notes explicitly marked visible to this patient */}
+                    <section className="bg-slate-800/60 border border-slate-700 rounded-2xl p-5 shadow-xl">
+                      <div className="flex items-start justify-between gap-3 mb-4">
+                        <div>
+                          <h3 className="text-sm font-bold text-white mb-1">Provider Instructions &amp; Patient Notes</h3>
+                          <p className="text-[11px] text-slate-400 leading-relaxed">
+                            Instructions and notes your healthcare providers chose to share with you appear here. Private provider notes are never shown in this section.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => user && loadPatientVisibleNotes(user.id)}
+                          disabled={patientVisibleNotesLoading}
+                          className="shrink-0 px-3 py-1.5 text-[10px] font-semibold bg-slate-900 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-300 disabled:opacity-50"
+                        >
+                          {patientVisibleNotesLoading ? 'Refreshing...' : 'Refresh'}
+                        </button>
+                      </div>
+
+                      {patientVisibleNotesError && (
+                        <p role="alert" className="mb-3 rounded-lg border border-red-900/60 bg-red-950/30 px-3 py-2 text-[10px] text-red-300 leading-relaxed break-words">
+                          {patientVisibleNotesError}
+                        </p>
+                      )}
+
+                      {patientVisibleNotesLoading ? (
+                        <p className="py-6 text-center text-[11px] text-slate-500">Loading provider instructions...</p>
+                      ) : patientVisibleNotes.length === 0 ? (
+                        <div className="rounded-xl border border-slate-800 bg-slate-900/30 px-4 py-6 text-center">
+                          <p className="text-xs font-semibold text-slate-300">No provider instructions yet</p>
+                          <p className="text-[10px] text-slate-500 mt-1">When a provider leaves a patient-visible note, it will appear here.</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-3">
+                          {patientVisibleNotes.map((note) => {
+                            const providerName = note.provider_profile?.display_name || note.provider_profile?.institution_name || 'Healthcare provider';
+                            return (
+                              <article key={note.id} className="rounded-xl border border-cyan-900/50 bg-cyan-950/20 p-4">
+                                <div className="flex flex-wrap items-start justify-between gap-2">
+                                  <div>
+                                    <p className="text-[11px] font-semibold text-cyan-200">{providerName}</p>
+                                    <p className="text-[9px] text-slate-500 mt-1">{note.created_at ? new Date(note.created_at).toLocaleString() : 'Provider note'}</p>
+                                  </div>
+                                  <span className="inline-flex rounded-full border border-cyan-800/70 bg-cyan-950/60 px-2 py-1 text-[9px] font-bold uppercase tracking-wide text-cyan-300">For You</span>
+                                </div>
+                                <p className="mt-3 whitespace-pre-wrap break-words text-xs leading-relaxed text-slate-200">{note.note_text}</p>
+                              </article>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </section>
 
                     {/* Current Medical Condition / Diagnosis — editable directly on the Dashboard */}
                     <div className="bg-slate-800/40 border border-slate-800 rounded-xl p-5">
